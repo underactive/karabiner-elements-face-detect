@@ -82,6 +82,7 @@ final class FaceProfileDaemon {
         noFaceTimeout: noFaceTimeout
     )
     private let stateQueue = DispatchQueue(label: "com.facedetector.stateMachine")
+    private let karabinerProcessQueue = DispatchQueue(label: "com.facedetector.karabinerCli", qos: .userInitiated)
 
     // Populated once at startup; used to verify sender device in HID callback
     private var builtinLocationIDs: Set<Int> = []
@@ -242,12 +243,15 @@ final class FaceProfileDaemon {
             }
         }
 
-        do {
-            try proc.run()
-        } catch {
-            stateQueue.async {
-                self.logger.error("Failed to launch karabiner_cli: \(error.localizedDescription, privacy: .public)")
-                self.stateMachine.onSwitchFailed()
+        karabinerProcessQueue.async { [weak self] in
+            guard let self else { return }
+            do {
+                try proc.run()
+            } catch {
+                self.stateQueue.async {
+                    self.logger.error("Failed to launch karabiner_cli: \(error.localizedDescription, privacy: .public)")
+                    self.stateMachine.onSwitchFailed()
+                }
             }
         }
     }
