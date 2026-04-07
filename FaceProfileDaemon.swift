@@ -271,8 +271,6 @@ final class FaceProfileDaemon {
 
     // Called on the dedicated HID RunLoop thread (com.user.face-profile-daemon.hid) — must dispatch to stateQueue before touching stateMachine.
     func onBuiltinHIDActivity(sender: UnsafeMutableRawPointer?) {
-        let now = CFAbsoluteTimeGetCurrent()
-
         if builtinLocationIDs.isEmpty {
             logger.warning("builtinLocationIDs is empty; ignoring HID activity to prevent failing open.")
             return
@@ -294,6 +292,7 @@ final class FaceProfileDaemon {
             return  // event from a non-built-in device (or missing location ID); discard
         }
         stateQueue.async {
+            let now = CFAbsoluteTimeGetCurrent()
             if now - self.lastHIDEventTime < 2.0 {
                 return
             }
