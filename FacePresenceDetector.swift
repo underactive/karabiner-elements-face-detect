@@ -79,6 +79,8 @@ public final class FacePresenceDetector {
 /// this object uses a deliberate self-retain cycle (selfRetain = self) that is
 /// broken exactly once when the first frame arrives, allowing normal ARC cleanup.
 private final class SingleFrameCapturer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+    private static let captureQueue = DispatchQueue(label: "com.facedetector.capture", qos: .userInitiated)
+
     private let continuation: CheckedContinuation<CVPixelBuffer, Error>
     private let session = AVCaptureSession()
     private var didCapture = false
@@ -112,14 +114,13 @@ private final class SingleFrameCapturer: NSObject, AVCaptureVideoDataOutputSampl
         guard session.canAddOutput(output) else { return finish(FaceDetectorError.cameraUnavailable) }
         session.addOutput(output)
 
-        let queue = DispatchQueue(label: "com.facedetector.capture", qos: .userInitiated)
-        output.setSampleBufferDelegate(self, queue: queue)
+        output.setSampleBufferDelegate(self, queue: Self.captureQueue)
 
-        queue.async {
+        Self.captureQueue.async {
             self.session.startRunning()
         }
 
-        queue.asyncAfter(deadline: .now() + 5) {
+        Self.captureQueue.asyncAfter(deadline: .now() + 5) {
             guard !self.didCapture else { return }
             self.didCapture = true
             self.session.stopRunning()
