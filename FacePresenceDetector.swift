@@ -1,3 +1,4 @@
+// Canonical implementation; built into the daemon binary by `make compile` alongside FaceProfileDaemon.swift and ProfileStateMachine.swift (see Makefile).
 import Foundation
 import AVFoundation
 import Vision
@@ -114,6 +115,10 @@ private final class SingleFrameCapturer: NSObject, AVCaptureVideoDataOutputSampl
         let queue = DispatchQueue(label: "com.facedetector.capture", qos: .userInitiated)
         output.setSampleBufferDelegate(self, queue: queue)
 
+        queue.async {
+            self.session.startRunning()
+        }
+
         queue.asyncAfter(deadline: .now() + 5) {
             guard !self.didCapture else { return }
             self.didCapture = true
@@ -121,8 +126,6 @@ private final class SingleFrameCapturer: NSObject, AVCaptureVideoDataOutputSampl
             self.selfRetain = nil
             self.continuation.resume(throwing: FaceDetectorError.captureFailed)
         }
-
-        session.startRunning()
     }
 
     func captureOutput(_ output: AVCaptureOutput,
