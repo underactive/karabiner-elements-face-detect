@@ -196,9 +196,15 @@ final class FaceProfileDaemon {
                     }
                 }
             } catch {
-                logger.error("Detection error: \(error.localizedDescription, privacy: .public)")
+                let nsError = error as NSError
+                logger.error("Detection error: \(error.localizedDescription, privacy: .public) (domain: \(nsError.domain, privacy: .public), code: \(nsError.code, privacy: .public))")
             }
-            try? await Task.sleep(for: .seconds(pollInterval))
+            do {
+                try await Task.sleep(for: .seconds(pollInterval))
+            } catch {
+                logger.debug("Face detection loop cancelled: \(error.localizedDescription, privacy: .public)")
+                break
+            }
         }
     }
 
@@ -221,9 +227,11 @@ final class FaceProfileDaemon {
         proc.terminationHandler = { [weak self] p in
             if p.terminationStatus != 0 {
                 self?.stateQueue.async {
-                    self?.logger.error("karabiner_cli exit \(p.terminationStatus) for '\(capturedProfile, privacy: .public)'")
+                    self?.logger.error("[FPD] karabiner_cli failed (exit \(p.terminationStatus)) for '\(capturedProfile, privacy: .public)'")
                     self?.stateMachine.onSwitchFailed()
                 }
+            } else {
+                self?.logger.debug("[FPD] karabiner_cli succeeded for '\(capturedProfile, privacy: .public)'")
             }
         }
 
