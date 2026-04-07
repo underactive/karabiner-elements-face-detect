@@ -113,6 +113,15 @@ private final class SingleFrameCapturer: NSObject, AVCaptureVideoDataOutputSampl
 
         let queue = DispatchQueue(label: "com.facedetector.capture", qos: .userInitiated)
         output.setSampleBufferDelegate(self, queue: queue)
+
+        queue.asyncAfter(deadline: .now() + 5) {
+            guard !self.didCapture else { return }
+            self.didCapture = true
+            self.session.stopRunning()
+            self.selfRetain = nil
+            self.continuation.resume(throwing: FaceDetectorError.captureFailed)
+        }
+
         session.startRunning()
     }
 
