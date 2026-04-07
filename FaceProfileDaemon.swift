@@ -9,10 +9,26 @@ import AVFoundation
 import Vision
 import IOKit
 import IOKit.hid
+import Security
 import os
 
 private let karabinerCLIPath =
     "/Library/Application Support/org.pqrs/Karabiner-Elements/bin/karabiner_cli"
+
+private func verifyCodeSignature(atPath path: String) -> Bool {
+    let url = URL(fileURLWithPath: path) as CFURL
+    var staticCode: SecStaticCode?
+    guard SecStaticCodeCreateWithPath(url, SecCSFlags(), &staticCode) == errSecSuccess,
+          let code = staticCode else {
+        return false
+    }
+    var requirement: SecRequirement?
+    guard SecRequirementCreateWithString("anchor apple generic" as CFString, SecCSFlags(), &requirement) == errSecSuccess,
+          let req = requirement else {
+        return false
+    }
+    return SecStaticCodeCheckValidityWithErrors(code, SecCSFlags(), req, nil) == errSecSuccess
+}
 
 // MARK: - FaceDetecting Protocol
 
@@ -43,6 +59,9 @@ final class DefaultKarabinerCLIExecutor: KarabinerCLIExecuting {
     }
 
     func runSelectProfile(_ profile: String) -> KarabinerExecutionResult {
+        guard verifyCodeSignature(atPath: cliPath) else {
+            return .launchFailed("Code signature verification failed for \(cliPath)")
+        }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: cliPath)
         proc.arguments = ["--select-profile", profile]
@@ -167,6 +186,10 @@ final class FaceProfileDaemon {
             logger.critical("karabiner_cli not found at \(karabinerCLIPath, privacy: .public)")
             exit(1)
         }
+        if !verifyCodeSignature(atPath: karabinerCLIPath) {
+            logger.critical("karabiner_cli at \(karabinerCLIPath, privacy: .public) failed code signature verification")
+            exit(1)
+        }
 
         builtinLocationIDs = enumerateBuiltinSPILocationIDs()
         logger.info("Built-in SPI HID location IDs: \(self.builtinLocationIDs.description, privacy: .public)")
@@ -229,16 +252,17 @@ final class FaceProfileDaemon {
 
             var iter = io_iterator_t(0)
             if IOServiceGetMatchingServices(kIOMainPortDefault, matching as CFDictionary, &iter) == KERN_SUCCESS {
+                defer { IOObjectRelease(iter) }
                 var svc = IOIteratorNext(iter)
                 while svc != IO_OBJECT_NULL {
-                    if let cf = IORegistryEntryCreateCFProperty(svc, kIOHIDLocationIDKey as CFString, kCFAllocatorDefault, 0) {
+                    let current = svc
+                    svc = IOIteratorNext(iter)
+                    defer { IOObjectRelease(current) }
+                    if let cf = IORegistryEntryCreateCFProperty(current, kIOHIDLocationIDKey as CFString, kCFAllocatorDefault, 0) {
                         let val = cf.takeRetainedValue()
                         if let n = val as? NSNumber { ids.insert(n.intValue) }
                     }
-                    IOObjectRelease(svc)
-                    svc = IOIteratorNext(iter)
                 }
-                IOObjectRelease(iter)
             }
         }
         return ids
@@ -384,6 +408,11 @@ final class FaceProfileDaemon {
     }
 
     private func executeProfileSwitch(_ profile: String) {
+        let allowed: Set<String> = [profileKeyboard, profileGhost]
+        guard allowed.contains(profile) else {
+            logger.error("Rejected unexpected profile name: '\(profile, privacy: .public)'")
+            return
+        }
         let capturedProfile = profile
         karabinerProcessQueue.async { [weak self] in
             guard let self else { return }
