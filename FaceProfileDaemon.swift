@@ -179,14 +179,19 @@ final class FaceProfileDaemon {
         hidManager = mgr
 
         hidThread = Thread { [weak self] in
-            IOHIDManagerScheduleWithRunLoop(mgr, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
+            guard let self = self else { return }
+            let runLoop = CFRunLoopGetCurrent()
+            IOHIDManagerScheduleWithRunLoop(mgr, runLoop, CFRunLoopMode.defaultMode.rawValue)
             let kr = IOHIDManagerOpen(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
             if kr != kIOReturnSuccess {
                 // HID monitoring is non-functional: noFaceStreak will not reset on
                 // keyboard/trackpad activity; only face-detection polls drive state.
-                self?.logger.warning("IOHIDManager open returned 0x\(String(kr, radix: 16), privacy: .public)")
+                self.logger.warning("IOHIDManager open returned 0x\(String(kr, radix: 16), privacy: .public)")
             }
-            CFRunLoopRun()
+            while !Thread.current.isCancelled {
+                CFRunLoopRunInMode(CFRunLoopMode.defaultMode, 0.5, false)
+            }
+            IOHIDManagerUnscheduleFromRunLoop(mgr, runLoop, CFRunLoopMode.defaultMode.rawValue)
         }
         hidThread?.name = "com.user.face-profile-daemon.hid"
         hidThread?.start()
@@ -199,7 +204,7 @@ final class FaceProfileDaemon {
         hidThread?.cancel()
     }
 
-    // Called from IOHIDManager callback (main RunLoop thread)
+    // Called on the dedicated HID RunLoop thread (com.user.face-profile-daemon.hid) — must dispatch to stateQueue before touching stateMachine.
     func onBuiltinHIDActivity(sender: UnsafeMutableRawPointer?) {
         let now = CFAbsoluteTimeGetCurrent()
 
@@ -238,6 +243,7 @@ final class FaceProfileDaemon {
 
     private func faceDetectionLoop() async {
         var consecutiveFailures = 0
+        var lastSleepTime = pollInterval
         while true {
             do {
                 let detected = try await detector.detectFace()
@@ -249,10 +255,13 @@ final class FaceProfileDaemon {
                         self.logger.info("Face detected → \(profileKeyboard, privacy: .public)")
                     }
                 } else {
+                    let increments = max(1, Int(lastSleepTime / pollInterval))
                     stateQueue.async {
-                        let action = self.stateMachine.onNoFace()
+                        for _ in 0..<increments {
+                            let action = self.stateMachine.onNoFace()
+                            self.handleAction(action)
+                        }
                         self.logger.info("No face. Streak: \(Int(self.stateMachine.noFaceStreak))s / \(Int(noFaceTimeout))s")
-                        self.handleAction(action)
                     }
                 }
             } catch {
@@ -260,9 +269,12 @@ final class FaceProfileDaemon {
                 let nsError = error as NSError
                 logger.error("Detection error: \(error.localizedDescription, privacy: .public) (domain: \(nsError.domain, privacy: .public), code: \(nsError.code, privacy: .public))")
                 if consecutiveFailures >= 5 {
+                    let increments = max(1, Int(lastSleepTime / pollInterval))
                     stateQueue.async {
-                        let action = self.stateMachine.onNoFace()
-                        self.handleAction(action)
+                        for _ in 0..<increments {
+                            let action = self.stateMachine.onNoFace()
+                            self.handleAction(action)
+                        }
                     }
                 }
             }
@@ -274,6 +286,7 @@ final class FaceProfileDaemon {
             } else {
                 sleepTime = pollInterval
             }
+            lastSleepTime = sleepTime
             
             do {
                 try await Task.sleep(for: .seconds(sleepTime))
