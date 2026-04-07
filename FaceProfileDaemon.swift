@@ -118,6 +118,7 @@ final class FaceProfileDaemon {
             self?.logger.info("Received SIGTERM, shutting down...")
             self?.detectionTask?.cancel()
             self?.karabinerProcessQueue.sync {}
+            self?.shutdown()
             CFRunLoopStop(CFRunLoopGetMain())
         }
         sigterm.resume()
@@ -129,13 +130,23 @@ final class FaceProfileDaemon {
             self?.logger.info("Received SIGINT, shutting down...")
             self?.detectionTask?.cancel()
             self?.karabinerProcessQueue.sync {}
+            self?.shutdown()
             CFRunLoopStop(CFRunLoopGetMain())
         }
         sigint.resume()
         self.sigintSource = sigint
 
         logger.info("Daemon started — poll every \(Int(pollInterval))s, ghost after \(Int(noFaceTimeout))s no-face")
-        RunLoop.main.run()
+        CFRunLoopRun()
+    }
+
+    func shutdown() {
+        if let mgr = hidManager {
+            IOHIDManagerClose(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
+            hidManager = nil
+        }
+        hidThread?.cancel()
+        hidThread = nil
     }
 
     // MARK: - IOKit: enumerate built-in SPI device location IDs (once at startup)
@@ -198,10 +209,7 @@ final class FaceProfileDaemon {
     }
 
     deinit {
-        if let mgr = hidManager {
-            IOHIDManagerClose(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
-        }
-        hidThread?.cancel()
+        shutdown()
     }
 
     // Called on the dedicated HID RunLoop thread (com.user.face-profile-daemon.hid) — must dispatch to stateQueue before touching stateMachine.
