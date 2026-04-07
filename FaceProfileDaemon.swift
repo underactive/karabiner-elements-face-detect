@@ -86,6 +86,7 @@ final class FaceProfileDaemon {
     // Populated once at startup; used to verify sender device in HID callback
     private var builtinLocationIDs: Set<Int> = []
     private var hidManager: IOHIDManager? = nil
+    private var lastHIDEventTime: CFAbsoluteTime = 0
     
     init(detector: FaceDetecting = FacePresenceDetector()) {
         self.detector = detector
@@ -160,6 +161,12 @@ final class FaceProfileDaemon {
 
     // Called from IOHIDManager callback (main RunLoop thread)
     func onBuiltinHIDActivity(sender: UnsafeMutableRawPointer?) {
+        let now = CFAbsoluteTimeGetCurrent()
+        if now - lastHIDEventTime < 2.0 {
+            return
+        }
+        lastHIDEventTime = now
+
         // Belt-and-suspenders: verify sender device is in our pre-enumerated set
         if let sender {
             let device = Unmanaged<IOHIDDevice>.fromOpaque(sender).takeUnretainedValue()
