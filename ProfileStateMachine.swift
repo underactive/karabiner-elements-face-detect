@@ -33,8 +33,8 @@ public struct ProfileStateMachine {
         return selectProfile(profileKeyboard)
     }
 
-    public mutating func onNoFace() -> Action {
-        noFaceStreak += pollInterval
+    public mutating func onNoFace(elapsed: Double? = nil) -> Action {
+        noFaceStreak += elapsed ?? pollInterval
         if noFaceStreak >= noFaceTimeout {
             return selectProfile(profileGhost)
         }

@@ -356,12 +356,9 @@ final class FaceProfileDaemon {
                         self.logger.info("Face detected → \(profileKeyboard, privacy: .public)")
                     }
                 } else {
-                    let increments = max(1, Int(lastSleepTime / pollInterval))
                     stateQueue.async {
-                        for _ in 0..<increments {
-                            let action = self.stateMachine.onNoFace()
-                            self.handleAction(action)
-                        }
+                        let action = self.stateMachine.onNoFace(elapsed: lastSleepTime)
+                        self.handleAction(action)
                         self.logger.info("No face. Streak: \(Int(self.stateMachine.noFaceStreak))s / \(Int(noFaceTimeout))s")
                     }
                 }
@@ -370,12 +367,9 @@ final class FaceProfileDaemon {
                 let nsError = error as NSError
                 logger.error("Detection error: \(error.localizedDescription, privacy: .public) (domain: \(nsError.domain, privacy: .public), code: \(nsError.code, privacy: .public))")
                 if consecutiveFailures >= 5 {
-                    let increments = max(1, Int(lastSleepTime / pollInterval))
                     stateQueue.async {
-                        for _ in 0..<increments {
-                            let action = self.stateMachine.onNoFace()
-                            self.handleAction(action)
-                        }
+                        let action = self.stateMachine.onNoFace(elapsed: lastSleepTime)
+                        self.handleAction(action)
                     }
                 }
             }
