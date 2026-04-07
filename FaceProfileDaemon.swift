@@ -89,6 +89,9 @@ final class FaceProfileDaemon {
     private var hidManager: IOHIDManager? = nil
     private var hidThread: Thread?
     private var lastHIDEventTime: CFAbsoluteTime = 0
+    private var detectionTask: Task<Void, Never>?
+    private var sigtermSource: DispatchSourceSignal?
+    private var sigintSource: DispatchSourceSignal?
     
     init(detector: FaceDetecting = FacePresenceDetector()) {
         self.detector = detector
@@ -107,7 +110,29 @@ final class FaceProfileDaemon {
 
         installHIDMonitor()
 
-        Task { await faceDetectionLoop() }
+        detectionTask = Task { await faceDetectionLoop() }
+
+        signal(SIGTERM, SIG_IGN)
+        let sigterm = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        sigterm.setEventHandler { [weak self] in
+            self?.logger.info("Received SIGTERM, shutting down...")
+            self?.detectionTask?.cancel()
+            self?.karabinerProcessQueue.sync {}
+            CFRunLoopStop(CFRunLoopGetMain())
+        }
+        sigterm.resume()
+        self.sigtermSource = sigterm
+
+        signal(SIGINT, SIG_IGN)
+        let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+        sigint.setEventHandler { [weak self] in
+            self?.logger.info("Received SIGINT, shutting down...")
+            self?.detectionTask?.cancel()
+            self?.karabinerProcessQueue.sync {}
+            CFRunLoopStop(CFRunLoopGetMain())
+        }
+        sigint.resume()
+        self.sigintSource = sigint
 
         logger.info("Daemon started — poll every \(Int(pollInterval))s, ghost after \(Int(noFaceTimeout))s no-face")
         RunLoop.main.run()
@@ -177,10 +202,6 @@ final class FaceProfileDaemon {
     // Called from IOHIDManager callback (main RunLoop thread)
     func onBuiltinHIDActivity(sender: UnsafeMutableRawPointer?) {
         let now = CFAbsoluteTimeGetCurrent()
-        if now - lastHIDEventTime < 2.0 {
-            return
-        }
-        lastHIDEventTime = now
 
         // Belt-and-suspenders: verify sender device is in our pre-enumerated set
         if let sender {
@@ -193,6 +214,11 @@ final class FaceProfileDaemon {
             }
         }
         stateQueue.async {
+            if now - self.lastHIDEventTime < 2.0 {
+                return
+            }
+            self.lastHIDEventTime = now
+
             let action = self.stateMachine.onHIDEvent()
             self.handleAction(action)
         }
@@ -201,9 +227,11 @@ final class FaceProfileDaemon {
     // MARK: - Face detection poll loop (Swift concurrency Task)
 
     private func faceDetectionLoop() async {
+        var consecutiveFailures = 0
         while true {
             do {
                 let detected = try await detector.detectFace()
+                consecutiveFailures = 0
                 if detected {
                     stateQueue.async {
                         let action = self.stateMachine.onFaceDetected()
@@ -218,11 +246,27 @@ final class FaceProfileDaemon {
                     }
                 }
             } catch {
+                consecutiveFailures += 1
                 let nsError = error as NSError
                 logger.error("Detection error: \(error.localizedDescription, privacy: .public) (domain: \(nsError.domain, privacy: .public), code: \(nsError.code, privacy: .public))")
+                if consecutiveFailures >= 5 {
+                    stateQueue.async {
+                        let action = self.stateMachine.onNoFace()
+                        self.handleAction(action)
+                    }
+                }
             }
+            
+            let sleepTime: Double
+            if consecutiveFailures >= 5 {
+                let backoffMultiplier = pow(2.0, Double(min(consecutiveFailures - 5, 8)))
+                sleepTime = min(300.0, pollInterval * backoffMultiplier)
+            } else {
+                sleepTime = pollInterval
+            }
+            
             do {
-                try await Task.sleep(for: .seconds(pollInterval))
+                try await Task.sleep(for: .seconds(sleepTime))
             } catch {
                 logger.debug("Face detection loop cancelled: \(error.localizedDescription, privacy: .public)")
                 break
@@ -240,27 +284,34 @@ final class FaceProfileDaemon {
     }
 
     private func executeProfileSwitch(_ profile: String) {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: karabinerCLIPath)
-        proc.arguments = ["--select-profile", profile]
-        proc.standardOutput = FileHandle.nullDevice
-
         let capturedProfile = profile
-        proc.terminationHandler = { [weak self] p in
-            if p.terminationStatus != 0 {
-                self?.stateQueue.async {
-                    self?.logger.error("[FPD] karabiner_cli failed (exit \(p.terminationStatus)) for '\(capturedProfile, privacy: .public)'")
-                    self?.stateMachine.onSwitchFailed()
-                }
-            } else {
-                self?.logger.debug("[FPD] karabiner_cli succeeded for '\(capturedProfile, privacy: .public)'")
-            }
-        }
-
         karabinerProcessQueue.async { [weak self] in
             guard let self else { return }
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: karabinerCLIPath)
+            proc.arguments = ["--select-profile", capturedProfile]
+            proc.standardOutput = FileHandle.nullDevice
+
+            let semaphore = DispatchSemaphore(value: 0)
+            proc.terminationHandler = { _ in semaphore.signal() }
+
             do {
                 try proc.run()
+                let result = semaphore.wait(timeout: .now() + 5.0)
+                if result == .timedOut {
+                    proc.terminate()
+                    self.stateQueue.async {
+                        self.logger.error("[FPD] karabiner_cli timed out for '\(capturedProfile, privacy: .public)'")
+                        self.stateMachine.onSwitchFailed()
+                    }
+                } else if proc.terminationStatus != 0 {
+                    self.stateQueue.async {
+                        self.logger.error("[FPD] karabiner_cli failed (exit \(proc.terminationStatus)) for '\(capturedProfile, privacy: .public)'")
+                        self.stateMachine.onSwitchFailed()
+                    }
+                } else {
+                    self.logger.debug("[FPD] karabiner_cli succeeded for '\(capturedProfile, privacy: .public)'")
+                }
             } catch {
                 self.stateQueue.async {
                     self.logger.error("Failed to launch karabiner_cli: \(error.localizedDescription, privacy: .public)")
