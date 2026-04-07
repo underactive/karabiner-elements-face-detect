@@ -203,15 +203,25 @@ final class FaceProfileDaemon {
     func onBuiltinHIDActivity(sender: UnsafeMutableRawPointer?) {
         let now = CFAbsoluteTimeGetCurrent()
 
-        // Belt-and-suspenders: verify sender device is in our pre-enumerated set
-        if let sender {
-            let device = Unmanaged<IOHIDDevice>.fromOpaque(sender).takeUnretainedValue()
-            if let cf = IOHIDDeviceGetProperty(device, kIOHIDLocationIDKey as CFString),
-               let n = cf as? NSNumber,
-               !builtinLocationIDs.isEmpty,
-               !builtinLocationIDs.contains(n.intValue) {
-                return  // event from a non-built-in device; discard
-            }
+        if builtinLocationIDs.isEmpty {
+            logger.warning("builtinLocationIDs is empty; ignoring HID activity to prevent failing open.")
+            return
+        }
+
+        guard let sender else {
+            return
+        }
+
+        let cfSender = Unmanaged<CFTypeRef>.fromOpaque(sender).takeUnretainedValue()
+        guard CFGetTypeID(cfSender) == IOHIDDeviceGetTypeID() else {
+            return
+        }
+
+        let device = Unmanaged<IOHIDDevice>.fromOpaque(sender).takeUnretainedValue()
+        guard let cf = IOHIDDeviceGetProperty(device, kIOHIDLocationIDKey as CFString),
+              let n = cf as? NSNumber,
+              builtinLocationIDs.contains(n.intValue) else {
+            return  // event from a non-built-in device (or missing location ID); discard
         }
         stateQueue.async {
             if now - self.lastHIDEventTime < 2.0 {
