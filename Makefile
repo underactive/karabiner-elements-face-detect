@@ -17,7 +17,7 @@ test:
 	swift test
 
 ## Compile, install binary + plist, start the LaunchAgent.
-## Camera TCC permission must be granted separately — see README.txt.
+## Camera TCC permission must be granted separately — see README.md.
 install: compile
 	mkdir -p "$(HOME)/.local/bin"
 	mkdir -p "$(HOME)/Library/LaunchAgents"
@@ -27,7 +27,7 @@ install: compile
 	launchctl bootstrap "gui/$$(id -u)" "$(PLIST_DST)"
 	@echo ""
 	@echo "Installed $(BIN)."
-	@echo "IMPORTANT: camera TCC permission is required — see README.txt."
+	@echo "IMPORTANT: camera TCC permission is required — see README.md."
 
 ## Stop the LaunchAgent and remove all installed files.
 uninstall:
