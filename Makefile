@@ -6,12 +6,15 @@ PLIST_DST = $(HOME)/Library/LaunchAgents/$(LABEL).plist
 LOG_OUT  = $(HOME)/Library/Logs/$(BIN).out.log
 LOG_ERR  = $(HOME)/Library/Logs/$(BIN).err.log
 
-.PHONY: compile install uninstall logs
+.PHONY: compile test install uninstall logs
 
-## Build the binary from FaceProfileDaemon.swift, which embeds FacePresenceDetector
-## inline so it is self-contained (also runnable as: swift FaceProfileDaemon.swift).
-compile: FaceProfileDaemon.swift
-	swiftc -O FaceProfileDaemon.swift -o $(BIN)
+## Build the binary from FaceProfileDaemon.swift + ProfileStateMachine.swift.
+compile: FaceProfileDaemon.swift ProfileStateMachine.swift
+	swiftc -O FaceProfileDaemon.swift ProfileStateMachine.swift -o $(BIN)
+
+## Run unit tests via Swift Package Manager.
+test:
+	swift test
 
 ## Compile, install binary + plist, start the LaunchAgent.
 ## Camera TCC permission must be granted separately — see README.txt.

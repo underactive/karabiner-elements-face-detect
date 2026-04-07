@@ -155,11 +155,16 @@ private func fpdHIDInputCallback(
 final class FaceProfileDaemon {
     private let detector = FacePresenceDetector()
 
-    // Shared mutable state — accessed from both the Swift concurrency poll task
-    // and the IOHIDManager RunLoop callback. For a 15 s poll interval the window
-    // for a missed update is harmless; production code should use an actor.
-    private var cachedProfile: String? = nil
-    private var noFaceStreak: Double = 0
+    // State machine — pure logic extracted for testability.
+    // Accessed from both the Swift concurrency poll task and the IOHIDManager
+    // RunLoop callback. For a 30 s poll interval the window for a missed update
+    // is harmless; production code should use an actor.
+    private var stateMachine = ProfileStateMachine(
+        profileKeyboard: profileKeyboard,
+        profileGhost: profileGhost,
+        pollInterval: pollInterval,
+        noFaceTimeout: noFaceTimeout
+    )
 
     // Populated once at startup; used to verify sender device in HID callback
     private var builtinLocationIDs: Set<Int> = []
@@ -237,8 +242,7 @@ final class FaceProfileDaemon {
                 return  // event from a non-built-in device; discard
             }
         }
-        noFaceStreak = 0
-        switchProfile(to: profileKeyboard)
+        handleAction(stateMachine.onHIDEvent())
     }
 
     // MARK: - Face detection poll loop (Swift concurrency Task)
@@ -248,15 +252,13 @@ final class FaceProfileDaemon {
             do {
                 let detected = try await detector.detectFace()
                 if detected {
-                    noFaceStreak = 0
-                    switchProfile(to: profileKeyboard)
+                    let action = stateMachine.onFaceDetected()
+                    handleAction(action)
                     stderr("[FPD] Face detected → \(profileKeyboard)")
                 } else {
-                    noFaceStreak += pollInterval
-                    stderr("[FPD] No face. Streak: \(Int(noFaceStreak))s / \(Int(noFaceTimeout))s")
-                    if noFaceStreak >= noFaceTimeout {
-                        switchProfile(to: profileGhost)
-                    }
+                    let action = stateMachine.onNoFace()
+                    stderr("[FPD] No face. Streak: \(Int(stateMachine.noFaceStreak))s / \(Int(noFaceTimeout))s")
+                    handleAction(action)
                 }
             } catch {
                 stderr("[FPD] Detection error: \(error.localizedDescription)")
@@ -265,13 +267,16 @@ final class FaceProfileDaemon {
         }
     }
 
-    // MARK: - Profile switching (caches last-known profile to avoid redundant CLI calls)
+    // MARK: - Profile switching
 
-    private func switchProfile(to profile: String) {
-        guard cachedProfile != profile else { return }
-        cachedProfile = profile
-        stderr("[FPD] Switching to '\(profile)'")
+    private func handleAction(_ action: ProfileStateMachine.Action) {
+        if case .switchProfile(let profile) = action {
+            stderr("[FPD] Switching to '\(profile)'")
+            executeProfileSwitch(profile)
+        }
+    }
 
+    private func executeProfileSwitch(_ profile: String) {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: karabinerCLIPath)
         proc.arguments = ["--select-profile", profile]
@@ -281,7 +286,7 @@ final class FaceProfileDaemon {
         proc.terminationHandler = { [weak self] p in
             if p.terminationStatus != 0 {
                 self?.stderr("[FPD] karabiner_cli exit \(p.terminationStatus) for '\(capturedProfile)'")
-                self?.cachedProfile = nil  // allow retry on next trigger
+                self?.stateMachine.onSwitchFailed()
             }
         }
 
@@ -289,7 +294,7 @@ final class FaceProfileDaemon {
             try proc.run()
         } catch {
             stderr("[FPD] Failed to launch karabiner_cli: \(error)")
-            cachedProfile = nil
+            stateMachine.onSwitchFailed()
         }
     }
 

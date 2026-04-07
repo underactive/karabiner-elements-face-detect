@@ -4,3 +4,4 @@ face-profile-daemon
 *.o
 *.swp
 .kaicho/
+.build/
