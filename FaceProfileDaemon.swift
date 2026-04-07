@@ -87,6 +87,7 @@ final class FaceProfileDaemon {
     // Populated once at startup; used to verify sender device in HID callback
     private var builtinLocationIDs: Set<Int> = []
     private var hidManager: IOHIDManager? = nil
+    private var hidThread: Thread?
     private var lastHIDEventTime: CFAbsoluteTime = 0
     
     init(detector: FaceDetecting = FacePresenceDetector()) {
@@ -149,15 +150,28 @@ final class FaceProfileDaemon {
 
         let ctx = Unmanaged.passUnretained(self).toOpaque()
         IOHIDManagerRegisterInputValueCallback(mgr, fpdHIDInputCallback, ctx)
-        IOHIDManagerScheduleWithRunLoop(mgr, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
 
-        let kr = IOHIDManagerOpen(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
-        if kr != kIOReturnSuccess {
-            // HID monitoring is non-functional: noFaceStreak will not reset on
-            // keyboard/trackpad activity; only face-detection polls drive state.
-            logger.warning("IOHIDManager open returned 0x\(String(kr, radix: 16), privacy: .public)")
-        }
         hidManager = mgr
+
+        hidThread = Thread { [weak self] in
+            IOHIDManagerScheduleWithRunLoop(mgr, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
+            let kr = IOHIDManagerOpen(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
+            if kr != kIOReturnSuccess {
+                // HID monitoring is non-functional: noFaceStreak will not reset on
+                // keyboard/trackpad activity; only face-detection polls drive state.
+                self?.logger.warning("IOHIDManager open returned 0x\(String(kr, radix: 16), privacy: .public)")
+            }
+            CFRunLoopRun()
+        }
+        hidThread?.name = "com.user.face-profile-daemon.hid"
+        hidThread?.start()
+    }
+
+    deinit {
+        if let mgr = hidManager {
+            IOHIDManagerClose(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
+        }
+        hidThread?.cancel()
     }
 
     // Called from IOHIDManager callback (main RunLoop thread)
