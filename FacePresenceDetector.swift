@@ -27,7 +27,6 @@ public enum FaceDetectorError: Error, LocalizedError {
 /// VNDetectFaceRectanglesRequest on the in-memory pixel buffer, then
 /// closes the session. No data is ever written to disk.
 public final class FacePresenceDetector: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
-    private let faceRequest = VNDetectFaceRectanglesRequest()
     private let session = AVCaptureSession()
     private let captureQueue = DispatchQueue(label: "com.facedetector.capture", qos: .userInitiated)
     private let sessionQueue = DispatchQueue(label: "com.facedetector.session", qos: .userInitiated)
@@ -126,6 +125,10 @@ public final class FacePresenceDetector: NSObject, AVCaptureVideoDataOutputSampl
     private func captureSingleFrame() async throws -> CVPixelBuffer {
         try configureSessionIfNeeded()
         
+        defer {
+            sessionQueue.async { self.session.stopRunning() }
+        }
+        
         return try await withCheckedThrowingContinuation { continuation in
             continuationLock.lock()
             if let existing = self.activeContinuation {
@@ -148,7 +151,6 @@ public final class FacePresenceDetector: NSObject, AVCaptureVideoDataOutputSampl
                 if let cont = self.activeContinuation {
                     self.activeContinuation = nil
                     self.continuationLock.unlock()
-                    self.sessionQueue.async { self.session.stopRunning() }
                     cont.resume(throwing: FaceDetectorError.captureFailed)
                 } else {
                     self.continuationLock.unlock()
@@ -168,8 +170,6 @@ public final class FacePresenceDetector: NSObject, AVCaptureVideoDataOutputSampl
         activeContinuation = nil
         continuationLock.unlock()
 
-        sessionQueue.async { self.session.stopRunning() }
-
         if let pb = CMSampleBufferGetImageBuffer(sampleBuffer) {
             continuation.resume(returning: pb)
         } else {
@@ -178,6 +178,7 @@ public final class FacePresenceDetector: NSObject, AVCaptureVideoDataOutputSampl
     }
 
     private func runVision(on pixelBuffer: CVPixelBuffer) throws -> Bool {
+        let faceRequest = VNDetectFaceRectanglesRequest()
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
         do {
             try handler.perform([faceRequest])
