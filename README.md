@@ -63,6 +63,8 @@ make install
 
 Compiles the binary, installs the plist, and starts the LaunchAgent.
 
+**IMPORTANT:** On modern macOS, the daemon will silently fail to access the camera after running `make install`. You **must** complete the steps in the [Workaround: thin app bundle wrapper](#workaround-thin-app-bundle-wrapper) section above for the daemon to function.
+
 ## Verify
 
 ```sh
