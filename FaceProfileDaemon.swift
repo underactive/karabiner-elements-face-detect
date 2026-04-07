@@ -93,6 +93,11 @@ final class DefaultKarabinerCLIExecutor: KarabinerCLIExecuting {
 // string. IOHIDManager with kIOHIDTransportKey == "SPI" natively scopes delivery
 // to built-in keyboard and trackpad only — no USB/Bluetooth events slip through.
 
+private class HIDContext {
+    weak var daemon: FaceProfileDaemon?
+    init(_ daemon: FaceProfileDaemon) { self.daemon = daemon }
+}
+
 private func fpdHIDInputCallback(
     context: UnsafeMutableRawPointer?,
     result: IOReturn,
@@ -100,9 +105,9 @@ private func fpdHIDInputCallback(
     value: IOHIDValue
 ) {
     guard let context else { return }
-    Unmanaged<FaceProfileDaemon>.fromOpaque(context)
+    Unmanaged<HIDContext>.fromOpaque(context)
         .takeUnretainedValue()
-        .onBuiltinHIDActivity(sender: sender)
+        .daemon?.onBuiltinHIDActivity(sender: sender)
 }
 
 // MARK: - Daemon
@@ -127,6 +132,7 @@ final class FaceProfileDaemon {
     private var builtinLocationIDs: Set<Int> = []
     private var hidManager: IOHIDManager? = nil
     private var hidThread: Thread?
+    private var hidContextPtr: UnsafeMutableRawPointer?
     private var lastHIDEventTime: CFAbsoluteTime = 0
     private var detectionTask: Task<Void, Never>?
     private var sigtermSource: DispatchSourceSignal?
@@ -199,8 +205,13 @@ final class FaceProfileDaemon {
 
     func shutdown() {
         if let mgr = hidManager {
+            IOHIDManagerRegisterInputValueCallback(mgr, nil, nil)
             IOHIDManagerClose(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
             hidManager = nil
+        }
+        if let ctx = hidContextPtr {
+            Unmanaged<HIDContext>.fromOpaque(ctx).release()
+            hidContextPtr = nil
         }
         hidThread?.cancel()
         hidThread = nil
@@ -241,7 +252,9 @@ final class FaceProfileDaemon {
         let matches = transports.map { ["IOProviderClass": "IOHIDDevice", kIOHIDTransportKey as String: $0] }
         IOHIDManagerSetDeviceMatchingMultiple(mgr, matches as CFArray)
 
-        let ctx = Unmanaged.passUnretained(self).toOpaque()
+        let contextObj = HIDContext(self)
+        let ctx = Unmanaged.passRetained(contextObj).toOpaque()
+        self.hidContextPtr = ctx
         IOHIDManagerRegisterInputValueCallback(mgr, fpdHIDInputCallback, ctx)
 
         hidManager = mgr
