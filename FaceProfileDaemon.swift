@@ -11,98 +11,13 @@ import Vision
 import IOKit
 import IOKit.hid
 
-// MARK: - Embedded FacePresenceDetector
-// (canonical source: FacePresenceDetector.swift)
+// MARK: - FaceDetecting Protocol
 
-public enum FaceDetectorError: Error, LocalizedError {
-    case cameraUnavailable
-    case accessDenied
-    case captureFailed
-    case visionError(Error)
-    public var errorDescription: String? {
-        switch self {
-        case .cameraUnavailable:  return "Built-in FaceTime camera not found"
-        case .accessDenied:       return "Camera access denied — check System Settings › Privacy › Camera"
-        case .captureFailed:      return "No pixel buffer received from camera"
-        case .visionError(let e): return "Vision analysis failed: \(e.localizedDescription)"
-        }
-    }
+public protocol FaceDetecting {
+    func detectFace() async throws -> Bool
 }
 
-public final class FacePresenceDetector {
-    public init() {}
-    public func detectFace() async throws -> Bool {
-        try await requestAccess()
-        guard let device = AVCaptureDevice.default(for: .video) else {
-            throw FaceDetectorError.cameraUnavailable
-        }
-        let pixelBuffer = try await SingleFrameCapturer.capture(from: device)
-        return try runVision(on: pixelBuffer)
-    }
-    private func requestAccess() async throws {
-        switch AVCaptureDevice.authorizationStatus(for: .video) {
-        case .authorized: return
-        case .notDetermined:
-            guard await AVCaptureDevice.requestAccess(for: .video) else {
-                throw FaceDetectorError.accessDenied
-            }
-        case .denied, .restricted: throw FaceDetectorError.accessDenied
-        @unknown default:          throw FaceDetectorError.accessDenied
-        }
-    }
-    private func runVision(on pixelBuffer: CVPixelBuffer) throws -> Bool {
-        let request = VNDetectFaceRectanglesRequest()
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
-        do { try handler.perform([request]) } catch { throw FaceDetectorError.visionError(error) }
-        return (request.results ?? []).contains { $0.confidence >= 0.5 }
-    }
-}
-
-private final class SingleFrameCapturer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
-    private let continuation: CheckedContinuation<CVPixelBuffer, Error>
-    private let session = AVCaptureSession()
-    private var didCapture = false
-    private var selfRetain: SingleFrameCapturer?
-    private init(continuation: CheckedContinuation<CVPixelBuffer, Error>) {
-        self.continuation = continuation
-    }
-    static func capture(from device: AVCaptureDevice) async throws -> CVPixelBuffer {
-        try await withCheckedThrowingContinuation { cont in
-            let c = SingleFrameCapturer(continuation: cont)
-            c.selfRetain = c
-            c.start(device: device)
-        }
-    }
-    private func start(device: AVCaptureDevice) {
-        session.sessionPreset = .medium
-        do {
-            let input = try AVCaptureDeviceInput(device: device)
-            guard session.canAddInput(input) else { return finish(FaceDetectorError.cameraUnavailable) }
-            session.addInput(input)
-        } catch { return finish(FaceDetectorError.cameraUnavailable) }
-        let output = AVCaptureVideoDataOutput()
-        output.alwaysDiscardsLateVideoFrames = true
-        output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
-        guard session.canAddOutput(output) else { return finish(FaceDetectorError.cameraUnavailable) }
-        session.addOutput(output)
-        let q = DispatchQueue(label: "com.facedetector.capture", qos: .userInitiated)
-        output.setSampleBufferDelegate(self, queue: q)
-        session.startRunning()
-    }
-    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard !didCapture else { return }
-        didCapture = true
-        session.stopRunning()
-        let retain = selfRetain; selfRetain = nil
-        if let pb = CMSampleBufferGetImageBuffer(sampleBuffer) {
-            continuation.resume(returning: pb)
-        } else {
-            continuation.resume(throwing: FaceDetectorError.captureFailed)
-        }
-        _ = retain
-    }
-    private func finish(_ error: Error) { selfRetain = nil; continuation.resume(throwing: error) }
-}
+extension FacePresenceDetector: FaceDetecting {}
 
 // MARK: - State Machine
 //
@@ -117,7 +32,7 @@ private final class SingleFrameCapturer: NSObject, AVCaptureVideoDataOutputSampl
 //  │   │  (profile: 👻)   │                          │  (profile: ⌨️)  │  │
 //  │   └──────────────────┘                          └──────────────────┘  │
 //  │                                                                        │
-//  │  noFaceStreak: incremented by pollInterval (15 s) each no-face poll   │
+//  │  noFaceStreak: incremented by pollInterval each no-face poll                │
 //  │               reset to 0 on face detected OR built-in HID event       │
 //  │  Profile switches are skipped when cachedProfile == target (no-op)    │
 //  └──────────────────────────────────────────────────────────────────────┘
@@ -126,6 +41,7 @@ private final class SingleFrameCapturer: NSObject, AVCaptureVideoDataOutputSampl
 
 private let karabinerCLIPath =
     "/Library/Application Support/org.pqrs/Karabiner-Elements/bin/karabiner_cli"
+// Must match Karabiner-Elements profile names exactly (case-sensitive, emoji included).
 private let profileKeyboard = "⌨️"
 private let profileGhost    = "👻"
 private let pollInterval: Double = 30    // seconds between face detection polls
@@ -153,26 +69,35 @@ private func fpdHIDInputCallback(
 // MARK: - Daemon
 
 final class FaceProfileDaemon {
-    private let detector = FacePresenceDetector()
+    private let detector: FaceDetecting
 
     // State machine — pure logic extracted for testability.
     // Accessed from both the Swift concurrency poll task and the IOHIDManager
-    // RunLoop callback. For a 30 s poll interval the window for a missed update
-    // is harmless; production code should use an actor.
+    // RunLoop callback. Synchronized via stateQueue.
     private var stateMachine = ProfileStateMachine(
         profileKeyboard: profileKeyboard,
         profileGhost: profileGhost,
         pollInterval: pollInterval,
         noFaceTimeout: noFaceTimeout
     )
+    private let stateQueue = DispatchQueue(label: "com.facedetector.stateMachine")
 
     // Populated once at startup; used to verify sender device in HID callback
     private var builtinLocationIDs: Set<Int> = []
     private var hidManager: IOHIDManager? = nil
+    
+    init(detector: FaceDetecting = FacePresenceDetector()) {
+        self.detector = detector
+    }
 
     // MARK: - Entry
 
     func run() {
+        if !FileManager.default.fileExists(atPath: karabinerCLIPath) {
+            stderr("[FPD] Critical error: karabiner_cli not found at \(karabinerCLIPath)")
+            exit(1)
+        }
+
         builtinLocationIDs = enumerateBuiltinSPILocationIDs()
         stderr("[FPD] Built-in SPI HID location IDs: \(builtinLocationIDs)")
 
@@ -188,25 +113,24 @@ final class FaceProfileDaemon {
 
     private func enumerateBuiltinSPILocationIDs() -> Set<Int> {
         var ids = Set<Int>()
-        // Build matching dict manually to avoid CFMutableDictionary bridging quirks.
-        // "IOProviderClass" is the key IOServiceMatching() sets internally.
-        let matching = NSMutableDictionary()
-        matching["IOProviderClass"] = "IOHIDDevice"
-        matching[kIOHIDTransportKey as String] = "SPI"
+        let transports = ["SPI", "AppleHID", "Internal"]
+        for transport in transports {
+            let matching = NSMutableDictionary()
+            matching["IOProviderClass"] = "IOHIDDevice"
+            matching[kIOHIDTransportKey as String] = transport
 
-        var iter = io_iterator_t(0)
-        guard IOServiceGetMatchingServices(kIOMainPortDefault, matching as CFDictionary, &iter) == KERN_SUCCESS else {
-            return ids
-        }
-        defer { IOObjectRelease(iter) }
-
-        var svc = IOIteratorNext(iter)
-        while svc != IO_OBJECT_NULL {
-            defer { IOObjectRelease(svc); svc = IOIteratorNext(iter) }
-            if let cf = IORegistryEntryCreateCFProperty(
-                svc, kIOHIDLocationIDKey as CFString, kCFAllocatorDefault, 0) {
-                let val = cf.takeRetainedValue()
-                if let n = val as? NSNumber { ids.insert(n.intValue) }
+            var iter = io_iterator_t(0)
+            if IOServiceGetMatchingServices(kIOMainPortDefault, matching as CFDictionary, &iter) == KERN_SUCCESS {
+                var svc = IOIteratorNext(iter)
+                while svc != IO_OBJECT_NULL {
+                    if let cf = IORegistryEntryCreateCFProperty(svc, kIOHIDLocationIDKey as CFString, kCFAllocatorDefault, 0) {
+                        let val = cf.takeRetainedValue()
+                        if let n = val as? NSNumber { ids.insert(n.intValue) }
+                    }
+                    IOObjectRelease(svc)
+                    svc = IOIteratorNext(iter)
+                }
+                IOObjectRelease(iter)
             }
         }
         return ids
@@ -216,8 +140,9 @@ final class FaceProfileDaemon {
 
     private func installHIDMonitor() {
         let mgr = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
-        let match = [kIOHIDTransportKey as String: "SPI"] as CFDictionary
-        IOHIDManagerSetDeviceMatching(mgr, match)
+        let transports = ["SPI", "AppleHID", "Internal"]
+        let matches = transports.map { ["IOProviderClass": "IOHIDDevice", kIOHIDTransportKey as String: $0] }
+        IOHIDManagerSetDeviceMatchingMultiple(mgr, matches as CFArray)
 
         let ctx = Unmanaged.passUnretained(self).toOpaque()
         IOHIDManagerRegisterInputValueCallback(mgr, fpdHIDInputCallback, ctx)
@@ -242,7 +167,10 @@ final class FaceProfileDaemon {
                 return  // event from a non-built-in device; discard
             }
         }
-        handleAction(stateMachine.onHIDEvent())
+        stateQueue.async {
+            let action = self.stateMachine.onHIDEvent()
+            self.handleAction(action)
+        }
     }
 
     // MARK: - Face detection poll loop (Swift concurrency Task)
@@ -252,13 +180,17 @@ final class FaceProfileDaemon {
             do {
                 let detected = try await detector.detectFace()
                 if detected {
-                    let action = stateMachine.onFaceDetected()
-                    handleAction(action)
-                    stderr("[FPD] Face detected → \(profileKeyboard)")
+                    stateQueue.async {
+                        let action = self.stateMachine.onFaceDetected()
+                        self.handleAction(action)
+                        self.stderr("[FPD] Face detected → \(profileKeyboard)")
+                    }
                 } else {
-                    let action = stateMachine.onNoFace()
-                    stderr("[FPD] No face. Streak: \(Int(stateMachine.noFaceStreak))s / \(Int(noFaceTimeout))s")
-                    handleAction(action)
+                    stateQueue.async {
+                        let action = self.stateMachine.onNoFace()
+                        self.stderr("[FPD] No face. Streak: \(Int(self.stateMachine.noFaceStreak))s / \(Int(noFaceTimeout))s")
+                        self.handleAction(action)
+                    }
                 }
             } catch {
                 stderr("[FPD] Detection error: \(error.localizedDescription)")
@@ -285,16 +217,20 @@ final class FaceProfileDaemon {
         let capturedProfile = profile
         proc.terminationHandler = { [weak self] p in
             if p.terminationStatus != 0 {
-                self?.stderr("[FPD] karabiner_cli exit \(p.terminationStatus) for '\(capturedProfile)'")
-                self?.stateMachine.onSwitchFailed()
+                self?.stateQueue.async {
+                    self?.stderr("[FPD] karabiner_cli exit \(p.terminationStatus) for '\(capturedProfile)'")
+                    self?.stateMachine.onSwitchFailed()
+                }
             }
         }
 
         do {
             try proc.run()
         } catch {
-            stderr("[FPD] Failed to launch karabiner_cli: \(error)")
-            stateMachine.onSwitchFailed()
+            stateQueue.async {
+                self.stderr("[FPD] Failed to launch karabiner_cli: \(error)")
+                self.stateMachine.onSwitchFailed()
+            }
         }
     }
 
