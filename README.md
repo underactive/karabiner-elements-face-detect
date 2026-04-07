@@ -43,6 +43,18 @@ open ~/.local/Applications/FaceProfileDaemon.app
 ~/.local/Applications/FaceProfileDaemon.app/Contents/MacOS/face-profile-daemon
 ```
 
+## Prerequisites
+
+1. **macOS 12+** — required for Swift Concurrency (`async`/`await`).
+2. **Karabiner-Elements** installed and running.
+3. **Two Karabiner-Elements profiles** named exactly:
+   - `⌨️` — active when a face is detected (normal typing)
+   - `👻` — active when no face is detected for ≥ 120 s
+
+   Create them in *Karabiner-Elements → Profiles* before running the daemon. The names are case-sensitive and must include the emoji — no quotes, no extra whitespace.
+
+   If the profiles are missing or misnamed, `karabiner_cli` will exit non-zero. The log will show `[FPD] karabiner_cli exit N for '...'` and the daemon will silently retry on the next poll cycle.
+
 ## Install
 
 ```sh
