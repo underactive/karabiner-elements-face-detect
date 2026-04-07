@@ -48,24 +48,30 @@ enum KarabinerExecutionResult: Equatable {
 }
 
 protocol KarabinerCLIExecuting: AnyObject {
+    var cliPath: String { get }
     func runSelectProfile(_ profile: String) -> KarabinerExecutionResult
 }
 
 final class DefaultKarabinerCLIExecutor: KarabinerCLIExecuting {
-    private let cliPath: String
+    let cliPath: String
+    private var isVerified = false
 
     init(cliPath: String = karabinerCLIPath) {
         self.cliPath = cliPath
     }
 
     func runSelectProfile(_ profile: String) -> KarabinerExecutionResult {
-        guard verifyCodeSignature(atPath: cliPath) else {
-            return .launchFailed("Code signature verification failed for \(cliPath)")
+        if !isVerified {
+            guard verifyCodeSignature(atPath: cliPath) else {
+                return .launchFailed("Code signature verification failed for \(cliPath)")
+            }
+            isVerified = true
         }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: cliPath)
         proc.arguments = ["--select-profile", profile]
         proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
 
         let semaphore = DispatchSemaphore(value: 0)
         proc.terminationHandler = { _ in semaphore.signal() }
@@ -114,7 +120,11 @@ final class DefaultKarabinerCLIExecutor: KarabinerCLIExecuting {
 
 private class HIDContext {
     weak var daemon: FaceProfileDaemon?
-    init(_ daemon: FaceProfileDaemon) { self.daemon = daemon }
+    let builtinLocationIDs: Set<Int>
+    init(_ daemon: FaceProfileDaemon, builtinLocationIDs: Set<Int>) {
+        self.daemon = daemon
+        self.builtinLocationIDs = builtinLocationIDs
+    }
 }
 
 private func fpdHIDInputCallback(
@@ -124,9 +134,8 @@ private func fpdHIDInputCallback(
     value: IOHIDValue
 ) {
     guard let context else { return }
-    Unmanaged<HIDContext>.fromOpaque(context)
-        .takeUnretainedValue()
-        .daemon?.onBuiltinHIDActivity(sender: sender)
+    let ctx = Unmanaged<HIDContext>.fromOpaque(context).takeUnretainedValue()
+    ctx.daemon?.onBuiltinHIDActivity(sender: sender, builtinLocationIDs: ctx.builtinLocationIDs)
 }
 
 // MARK: - Daemon
@@ -151,6 +160,8 @@ final class FaceProfileDaemon {
     private var builtinLocationIDs: Set<Int> = []
     private var hidManager: IOHIDManager? = nil
     private var hidThread: Thread?
+    private var hidRunLoop: CFRunLoop?
+    private var hidContext: HIDContext?
     private var hidContextPtr: UnsafeMutableRawPointer?
     private var lastHIDEventTime: CFAbsoluteTime = 0
     private var detectionTask: Task<Void, Never>?
@@ -182,12 +193,13 @@ final class FaceProfileDaemon {
     // MARK: - Entry
 
     func run() {
-        if !FileManager.default.fileExists(atPath: karabinerCLIPath) {
-            logger.critical("karabiner_cli not found at \(karabinerCLIPath, privacy: .public)")
+        let cliPath = karabiner.cliPath
+        if !FileManager.default.fileExists(atPath: cliPath) {
+            logger.critical("karabiner_cli not found at \(cliPath, privacy: .public)")
             exit(1)
         }
-        if !verifyCodeSignature(atPath: karabinerCLIPath) {
-            logger.critical("karabiner_cli at \(karabinerCLIPath, privacy: .public) failed code signature verification")
+        if !verifyCodeSignature(atPath: cliPath) {
+            logger.critical("karabiner_cli at \(cliPath, privacy: .public) failed code signature verification")
             exit(1)
         }
 
@@ -232,9 +244,11 @@ final class FaceProfileDaemon {
             IOHIDManagerClose(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
             hidManager = nil
         }
-        if let ctx = hidContextPtr {
-            Unmanaged<HIDContext>.fromOpaque(ctx).release()
-            hidContextPtr = nil
+        hidContextPtr = nil
+        hidContext = nil
+        if let rl = hidRunLoop {
+            CFRunLoopStop(rl)
+            hidRunLoop = nil
         }
         hidThread?.cancel()
         hidThread = nil
@@ -276,8 +290,9 @@ final class FaceProfileDaemon {
         let matches = transports.map { ["IOProviderClass": "IOHIDDevice", kIOHIDTransportKey as String: $0] }
         IOHIDManagerSetDeviceMatchingMultiple(mgr, matches as CFArray)
 
-        let contextObj = HIDContext(self)
-        let ctx = Unmanaged.passRetained(contextObj).toOpaque()
+        let contextObj = HIDContext(self, builtinLocationIDs: self.builtinLocationIDs)
+        self.hidContext = contextObj
+        let ctx = Unmanaged.passUnretained(contextObj).toOpaque()
         self.hidContextPtr = ctx
         IOHIDManagerRegisterInputValueCallback(mgr, fpdHIDInputCallback, ctx)
 
@@ -286,6 +301,7 @@ final class FaceProfileDaemon {
         hidThread = Thread { [weak self] in
             guard let self = self else { return }
             let runLoop = CFRunLoopGetCurrent()
+            self.hidRunLoop = runLoop
             IOHIDManagerScheduleWithRunLoop(mgr, runLoop, CFRunLoopMode.defaultMode.rawValue)
             let kr = IOHIDManagerOpen(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
             if kr != kIOReturnSuccess {
@@ -293,9 +309,7 @@ final class FaceProfileDaemon {
                 // keyboard/trackpad activity; only face-detection polls drive state.
                 self.logger.warning("IOHIDManager open returned 0x\(String(kr, radix: 16), privacy: .public)")
             }
-            while !Thread.current.isCancelled {
-                CFRunLoopRunInMode(CFRunLoopMode.defaultMode, 0.5, false)
-            }
+            CFRunLoopRun()
             IOHIDManagerUnscheduleFromRunLoop(mgr, runLoop, CFRunLoopMode.defaultMode.rawValue)
         }
         hidThread?.name = "com.user.face-profile-daemon.hid"
@@ -307,7 +321,7 @@ final class FaceProfileDaemon {
     }
 
     // Called on the dedicated HID RunLoop thread (com.user.face-profile-daemon.hid) — must dispatch to stateQueue before touching stateMachine.
-    func onBuiltinHIDActivity(sender: UnsafeMutableRawPointer?) {
+    func onBuiltinHIDActivity(sender: UnsafeMutableRawPointer?, builtinLocationIDs: Set<Int>) {
         if builtinLocationIDs.isEmpty {
             logger.warning("builtinLocationIDs is empty; ignoring HID activity to prevent failing open.")
             return
@@ -346,6 +360,7 @@ final class FaceProfileDaemon {
         var consecutiveFailures = 0
         var lastSleepTime = pollInterval
         while true {
+            if Task.isCancelled { break }
             do {
                 let detected = try await detector.detectFace()
                 consecutiveFailures = 0
