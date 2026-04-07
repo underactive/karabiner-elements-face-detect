@@ -31,7 +31,7 @@ public final class FacePresenceDetector: NSObject, AVCaptureVideoDataOutputSampl
     private let captureQueue = DispatchQueue(label: "com.facedetector.capture", qos: .userInitiated)
     private let sessionQueue = DispatchQueue(label: "com.facedetector.session", qos: .userInitiated)
     private var isConfigured = false
-    private var activeContinuation: CheckedContinuation<CVPixelBuffer, Error>?
+    private var activeContinuation: CheckedContinuation<CMSampleBuffer, Error>?
     private let continuationLock = NSLock()
     
     private var isDetecting = false
@@ -60,8 +60,13 @@ public final class FacePresenceDetector: NSObject, AVCaptureVideoDataOutputSampl
         }
         
         try await requestAccess()
-        let pixelBuffer = try await captureSingleFrame()
-        return try runVision(on: pixelBuffer)
+        let sampleBuffer = try await captureSingleFrame()
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+            throw FaceDetectorError.captureFailed
+        }
+        return try withExtendedLifetime(sampleBuffer) {
+            try runVision(on: pixelBuffer)
+        }
     }
 
     // MARK: - Private helpers
@@ -122,7 +127,7 @@ public final class FacePresenceDetector: NSObject, AVCaptureVideoDataOutputSampl
         }
     }
 
-    private func captureSingleFrame() async throws -> CVPixelBuffer {
+    private func captureSingleFrame() async throws -> CMSampleBuffer {
         try configureSessionIfNeeded()
         
         defer {
@@ -170,11 +175,7 @@ public final class FacePresenceDetector: NSObject, AVCaptureVideoDataOutputSampl
         activeContinuation = nil
         continuationLock.unlock()
 
-        if let pb = CMSampleBufferGetImageBuffer(sampleBuffer) {
-            continuation.resume(returning: pb)
-        } else {
-            continuation.resume(throwing: FaceDetectorError.captureFailed)
-        }
+        continuation.resume(returning: sampleBuffer)
     }
 
     private func runVision(on pixelBuffer: CVPixelBuffer) throws -> Bool {
