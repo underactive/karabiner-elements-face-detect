@@ -1,9 +1,8 @@
 // FaceProfileDaemon.swift
-// Run standalone:  swift FaceProfileDaemon.swift
-// Compile binary:  swiftc -O FaceProfileDaemon.swift -o face-profile-daemon
+// Compile binary:  make compile
 //
-// FacePresenceDetector is embedded inline below so this file is self-contained.
-// When compiling the release binary the Makefile compiles only this file.
+// Requires FacePresenceDetector.swift and ProfileStateMachine.swift — the
+// Makefile compiles all three files together.
 
 import Foundation
 import AVFoundation
@@ -150,6 +149,8 @@ final class FaceProfileDaemon {
 
         let kr = IOHIDManagerOpen(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
         if kr != kIOReturnSuccess {
+            // HID monitoring is non-functional: noFaceStreak will not reset on
+            // keyboard/trackpad activity; only face-detection polls drive state.
             stderr("[FPD] Warning: IOHIDManager open returned 0x\(String(kr, radix: 16))")
         }
         hidManager = mgr
@@ -195,7 +196,7 @@ final class FaceProfileDaemon {
             } catch {
                 stderr("[FPD] Detection error: \(error.localizedDescription)")
             }
-            try? await Task.sleep(nanoseconds: UInt64(pollInterval * 1_000_000_000))
+            try? await Task.sleep(for: .seconds(pollInterval))
         }
     }
 
