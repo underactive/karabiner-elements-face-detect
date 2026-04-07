@@ -173,7 +173,7 @@ final class FaceProfileDaemon {
         karabiner: KarabinerCLIExecuting = DefaultKarabinerCLIExecutor(),
         profileKeyboard: String = "⌨️",
         profileGhost: String = "👻",
-        pollInterval: Double = 30,
+        pollInterval: Double = 60,
         noFaceTimeout: Double = 120
     ) {
         self.detector = detector
@@ -234,7 +234,7 @@ final class FaceProfileDaemon {
         sigint.resume()
         self.sigintSource = sigint
 
-        logger.info("Daemon started — poll every \(Int(pollInterval))s, ghost after \(Int(noFaceTimeout))s no-face")
+        logger.info("Daemon started — poll every \(Int(self.pollInterval))s, ghost after \(Int(self.noFaceTimeout))s no-face")
         CFRunLoopRun()
     }
 
@@ -300,7 +300,7 @@ final class FaceProfileDaemon {
 
         hidThread = Thread { [weak self] in
             guard let self = self else { return }
-            let runLoop = CFRunLoopGetCurrent()
+            guard let runLoop = CFRunLoopGetCurrent() else { return }
             self.hidRunLoop = runLoop
             IOHIDManagerScheduleWithRunLoop(mgr, runLoop, CFRunLoopMode.defaultMode.rawValue)
             let kr = IOHIDManagerOpen(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
@@ -368,13 +368,13 @@ final class FaceProfileDaemon {
                     stateQueue.async {
                         let action = self.stateMachine.onFaceDetected()
                         self.handleAction(action)
-                        self.logger.info("Face detected → \(profileKeyboard, privacy: .public)")
+                        self.logger.info("Face detected → \(self.profileKeyboard, privacy: .public)")
                     }
                 } else {
                     stateQueue.async {
                         let action = self.stateMachine.onNoFace(elapsed: lastSleepTime)
                         self.handleAction(action)
-                        self.logger.info("No face. Streak: \(Int(self.stateMachine.noFaceStreak))s / \(Int(noFaceTimeout))s")
+                        self.logger.info("No face. Streak: \(Int(self.stateMachine.noFaceStreak))s / \(Int(self.noFaceTimeout))s")
                     }
                 }
             } catch {

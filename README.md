@@ -69,8 +69,25 @@ Compiles the binary, installs the plist, and starts the LaunchAgent.
 
 ```sh
 launchctl list | grep face-profile-daemon   # PID column should be non-zero
-make logs                                   # stream live log output
 ```
+
+## Logs
+
+The daemon uses Apple's unified logging system (`os.Logger`). Log output is **not** written to plain text files — use the `log` tool to read it.
+
+**Stream live output** (shows new entries as they arrive):
+```sh
+log stream --predicate 'subsystem == "com.user.face-profile-daemon"' --level debug
+```
+
+**Query past entries** (e.g. last hour):
+```sh
+log show --predicate 'subsystem == "com.user.face-profile-daemon"' --last 1h --level debug
+```
+
+Omit `--level debug` to suppress debug-level noise and see only info/error entries.
+
+> `make logs` tails the LaunchAgent stdout/stderr files in `~/Library/Logs/` — those will be empty because `os.Logger` bypasses file descriptors entirely.
 
 ## Stop / uninstall
 
