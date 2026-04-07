@@ -90,7 +90,7 @@ public final class FacePresenceDetector: NSObject, AVCaptureVideoDataOutputSampl
         try sessionQueue.sync {
             guard !isConfigured else { return }
 
-            guard let device = AVCaptureDevice.default(for: .video) else {
+            guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front) else {
                 throw FaceDetectorError.cameraUnavailable
             }
 
