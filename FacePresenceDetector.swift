@@ -179,7 +179,7 @@ public final class FacePresenceDetector: NSObject, AVCaptureVideoDataOutputSampl
 
     private func runVision(on pixelBuffer: CVPixelBuffer) throws -> Bool {
         let faceRequest = VNDetectFaceRectanglesRequest()
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
         do {
             try handler.perform([faceRequest])
         } catch {
