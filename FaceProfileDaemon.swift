@@ -312,12 +312,12 @@ final class FaceProfileDaemon {
                     proc.terminate()
                     self.stateQueue.async {
                         self.logger.error("[FPD] karabiner_cli timed out for '\(capturedProfile, privacy: .public)'")
-                        self.stateMachine.onSwitchFailed()
+                        self.stateMachine.onSwitchFailed(forProfile: capturedProfile)
                     }
                 } else if proc.terminationStatus != 0 {
                     self.stateQueue.async {
                         self.logger.error("[FPD] karabiner_cli failed (exit \(proc.terminationStatus)) for '\(capturedProfile, privacy: .public)'")
-                        self.stateMachine.onSwitchFailed()
+                        self.stateMachine.onSwitchFailed(forProfile: capturedProfile)
                     }
                 } else {
                     self.logger.debug("[FPD] karabiner_cli succeeded for '\(capturedProfile, privacy: .public)'")
@@ -325,7 +325,7 @@ final class FaceProfileDaemon {
             } catch {
                 self.stateQueue.async {
                     self.logger.error("Failed to launch karabiner_cli: \(error.localizedDescription, privacy: .public)")
-                    self.stateMachine.onSwitchFailed()
+                    self.stateMachine.onSwitchFailed(forProfile: capturedProfile)
                 }
             }
         }

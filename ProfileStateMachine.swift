@@ -46,8 +46,10 @@ public struct ProfileStateMachine {
         return selectProfile(profileKeyboard)
     }
 
-    public mutating func onSwitchFailed() {
-        cachedProfile = nil
+    public mutating func onSwitchFailed(forProfile profile: String) {
+        if cachedProfile == profile {
+            cachedProfile = nil
+        }
     }
 
     private mutating func selectProfile(_ profile: String) -> Action {

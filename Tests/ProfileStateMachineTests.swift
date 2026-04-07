@@ -104,7 +104,7 @@ final class ProfileStateMachineTests: XCTestCase {
         XCTAssertEqual(sm.onFaceDetected(), .switchProfile("⌨️"))
 
         // Simulate CLI failure
-        sm.onSwitchFailed()
+        sm.onSwitchFailed(forProfile: "⌨️")
         XCTAssertNil(sm.cachedProfile)
 
         // Retry should produce a switch action again
