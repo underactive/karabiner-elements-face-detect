@@ -1,0 +1,27 @@
+{
+  "agents": [
+    "claude",
+    "cursor:gm",
+    "cursor:comp"
+  ],
+  "models": {
+    "claude": "sonnet[1m]",
+    "cursor:gm": "gemini-3-flash",
+    "cursor:comp": "composer-2-fast"
+  },
+  "fixModels": {
+    "claude": "opus[1m]",
+    "cursor:gm": "gemini-3.1-pro",
+    "cursor:comp": "composer-2"
+  },
+  "reviewers": [
+    "cursor:composer-2-fast",
+    "opencode:nemotron",
+    "opencode:minimax",
+    "gemini",
+    "codex:gpt-5.1-codex-mini"
+  ],
+  "concurrency": 4,
+  "retention": 3,
+  "summarizerModel": "gemma3:1b"
+}
