@@ -148,6 +148,7 @@ public final class FacePresenceDetector: NSObject, AVCaptureVideoDataOutputSampl
                 if let cont = self.activeContinuation {
                     self.activeContinuation = nil
                     self.continuationLock.unlock()
+                    self.sessionQueue.async { self.session.stopRunning() }
                     cont.resume(throwing: FaceDetectorError.captureFailed)
                 } else {
                     self.continuationLock.unlock()
@@ -166,7 +167,9 @@ public final class FacePresenceDetector: NSObject, AVCaptureVideoDataOutputSampl
         }
         activeContinuation = nil
         continuationLock.unlock()
-        
+
+        sessionQueue.async { self.session.stopRunning() }
+
         if let pb = CMSampleBufferGetImageBuffer(sampleBuffer) {
             continuation.resume(returning: pb)
         } else {
