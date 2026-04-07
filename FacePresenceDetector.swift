@@ -26,20 +26,24 @@ public enum FaceDetectorError: Error, LocalizedError {
 /// Opens a one-shot AVCaptureSession, grabs a single frame, runs
 /// VNDetectFaceRectanglesRequest on the in-memory pixel buffer, then
 /// closes the session. No data is ever written to disk.
-public final class FacePresenceDetector {
-    public init() {}
+public final class FacePresenceDetector: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+    private let faceRequest = VNDetectFaceRectanglesRequest()
+    private let session = AVCaptureSession()
+    private let captureQueue = DispatchQueue(label: "com.facedetector.capture", qos: .userInitiated)
+    private var isConfigured = false
+    private var activeContinuation: CheckedContinuation<CVPixelBuffer, Error>?
+
+    public override init() {
+        super.init()
+    }
 
     /// Returns `true` if ≥1 face with confidence ≥ 0.5 is detected in the
     /// current camera frame. Throws `FaceDetectorError` on any camera or
     /// Vision failure — never silently returns `false`.
     public func detectFace() async throws -> Bool {
         try await requestAccess()
-        guard let device = AVCaptureDevice.default(for: .video) else {
-            throw FaceDetectorError.cameraUnavailable
-        }
-        let pixelBuffer = try await SingleFrameCapturer.capture(from: device)
+        let pixelBuffer = try await captureSingleFrame()
         return try runVision(on: pixelBuffer)
-        // pixelBuffer is released here when it exits scope
     }
 
     // MARK: - Private helpers
@@ -59,97 +63,80 @@ public final class FacePresenceDetector {
         }
     }
 
-    private func runVision(on pixelBuffer: CVPixelBuffer) throws -> Bool {
-        let request = VNDetectFaceRectanglesRequest()
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
-        do {
-            try handler.perform([request])
-        } catch {
-            throw FaceDetectorError.visionError(error)
+    private func configureSessionIfNeeded() throws {
+        guard !isConfigured else { return }
+        
+        guard let device = AVCaptureDevice.default(for: .video) else {
+            throw FaceDetectorError.cameraUnavailable
         }
-        return (request.results ?? []).contains { $0.confidence >= 0.5 }
-    }
-}
-
-// MARK: - SingleFrameCapturer
-
-/// Bridges AVCaptureVideoDataOutputSampleBufferDelegate to async/await.
-///
-/// AVCaptureVideoDataOutput keeps only a *weak* reference to its delegate, so
-/// this object uses a deliberate self-retain cycle (selfRetain = self) that is
-/// broken exactly once when the first frame arrives, allowing normal ARC cleanup.
-private final class SingleFrameCapturer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
-    private static let captureQueue = DispatchQueue(label: "com.facedetector.capture", qos: .userInitiated)
-
-    private let continuation: CheckedContinuation<CVPixelBuffer, Error>
-    private let session = AVCaptureSession()
-    private var didCapture = false
-    private var selfRetain: SingleFrameCapturer? // broken after first frame
-
-    private init(continuation: CheckedContinuation<CVPixelBuffer, Error>) {
-        self.continuation = continuation
-    }
-
-    static func capture(from device: AVCaptureDevice) async throws -> CVPixelBuffer {
-        try await withCheckedThrowingContinuation { continuation in
-            let c = SingleFrameCapturer(continuation: continuation)
-            c.selfRetain = c        // prevent ARC from dropping delegate before callback fires
-            c.start(device: device)
-        }
-    }
-
-    private func start(device: AVCaptureDevice) {
+        
         session.sessionPreset = .medium
+        
         do {
             let input = try AVCaptureDeviceInput(device: device)
-            guard session.canAddInput(input) else { return finish(FaceDetectorError.cameraUnavailable) }
+            guard session.canAddInput(input) else { throw FaceDetectorError.cameraUnavailable }
             session.addInput(input)
         } catch {
-            return finish(FaceDetectorError.cameraUnavailable)
+            throw FaceDetectorError.cameraUnavailable
         }
-
+        
         let output = AVCaptureVideoDataOutput()
         output.alwaysDiscardsLateVideoFrames = true
         output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
-        guard session.canAddOutput(output) else { return finish(FaceDetectorError.cameraUnavailable) }
+        guard session.canAddOutput(output) else { throw FaceDetectorError.cameraUnavailable }
         session.addOutput(output)
+        
+        output.setSampleBufferDelegate(self, queue: captureQueue)
+        
+        isConfigured = true
+    }
 
-        output.setSampleBufferDelegate(self, queue: Self.captureQueue)
-
-        Self.captureQueue.async {
-            self.session.startRunning()
-        }
-
-        Self.captureQueue.asyncAfter(deadline: .now() + 5) {
-            guard !self.didCapture else { return }
-            self.didCapture = true
-            self.session.stopRunning()
-            self.selfRetain = nil
-            self.continuation.resume(throwing: FaceDetectorError.captureFailed)
+    private func captureSingleFrame() async throws -> CVPixelBuffer {
+        try configureSessionIfNeeded()
+        
+        return try await withCheckedThrowingContinuation { continuation in
+            captureQueue.async {
+                if let existing = self.activeContinuation {
+                    existing.resume(throwing: FaceDetectorError.captureFailed)
+                }
+                self.activeContinuation = continuation
+                self.session.startRunning()
+                
+                // Timeout fallback
+                self.captureQueue.asyncAfter(deadline: .now() + 5) { [weak self] in
+                    guard let self = self, self.activeContinuation != nil else { return }
+                    let cont = self.activeContinuation
+                    self.activeContinuation = nil
+                    self.session.stopRunning()
+                    cont?.resume(throwing: FaceDetectorError.captureFailed)
+                }
+            }
         }
     }
 
-    func captureOutput(_ output: AVCaptureOutput,
-                       didOutput sampleBuffer: CMSampleBuffer,
-                       from connection: AVCaptureConnection) {
-        guard !didCapture else { return }
-        didCapture = true
+    public func captureOutput(_ output: AVCaptureOutput,
+                              didOutput sampleBuffer: CMSampleBuffer,
+                              from connection: AVCaptureConnection) {
+        guard let continuation = activeContinuation else { return }
+        activeContinuation = nil
+        
         session.stopRunning()
-        // Keep self alive past continuation.resume() by holding retain on stack
-        let retain = selfRetain
-        selfRetain = nil
+        
         if let pb = CMSampleBufferGetImageBuffer(sampleBuffer) {
             continuation.resume(returning: pb)
         } else {
             continuation.resume(throwing: FaceDetectorError.captureFailed)
         }
-        _ = retain
     }
 
-    private func finish(_ error: Error) {
-        // self is kept alive by implicit method receiver ref until this returns
-        selfRetain = nil
-        continuation.resume(throwing: error)
+    private func runVision(on pixelBuffer: CVPixelBuffer) throws -> Bool {
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
+        do {
+            try handler.perform([faceRequest])
+        } catch {
+            throw FaceDetectorError.visionError(error)
+        }
+        return (faceRequest.results ?? []).contains { $0.confidence >= 0.5 }
     }
 }
 
