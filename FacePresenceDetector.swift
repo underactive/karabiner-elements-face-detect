@@ -30,8 +30,13 @@ public final class FacePresenceDetector: NSObject, AVCaptureVideoDataOutputSampl
     private let faceRequest = VNDetectFaceRectanglesRequest()
     private let session = AVCaptureSession()
     private let captureQueue = DispatchQueue(label: "com.facedetector.capture", qos: .userInitiated)
+    private let sessionQueue = DispatchQueue(label: "com.facedetector.session", qos: .userInitiated)
     private var isConfigured = false
     private var activeContinuation: CheckedContinuation<CVPixelBuffer, Error>?
+    private let continuationLock = NSLock()
+    
+    private var isDetecting = false
+    private let stateLock = NSLock()
 
     public override init() {
         super.init()
@@ -41,6 +46,20 @@ public final class FacePresenceDetector: NSObject, AVCaptureVideoDataOutputSampl
     /// current camera frame. Throws `FaceDetectorError` on any camera or
     /// Vision failure — never silently returns `false`.
     public func detectFace() async throws -> Bool {
+        stateLock.lock()
+        guard !isDetecting else {
+            stateLock.unlock()
+            throw FaceDetectorError.captureFailed
+        }
+        isDetecting = true
+        stateLock.unlock()
+        
+        defer {
+            stateLock.lock()
+            isDetecting = false
+            stateLock.unlock()
+        }
+        
         try await requestAccess()
         let pixelBuffer = try await captureSingleFrame()
         return try runVision(on: pixelBuffer)
@@ -64,11 +83,21 @@ public final class FacePresenceDetector: NSObject, AVCaptureVideoDataOutputSampl
     }
 
     private func configureSessionIfNeeded() throws {
-        try captureQueue.sync {
+        try sessionQueue.sync {
             guard !isConfigured else { return }
 
             guard let device = AVCaptureDevice.default(for: .video) else {
                 throw FaceDetectorError.cameraUnavailable
+            }
+
+            session.beginConfiguration()
+            var success = false
+            defer {
+                if !success {
+                    for input in session.inputs { session.removeInput(input) }
+                    for output in session.outputs { session.removeOutput(output) }
+                }
+                session.commitConfiguration()
             }
 
             session.sessionPreset = .medium
@@ -89,6 +118,7 @@ public final class FacePresenceDetector: NSObject, AVCaptureVideoDataOutputSampl
 
             output.setSampleBufferDelegate(self, queue: captureQueue)
 
+            success = true
             isConfigured = true
         }
     }
@@ -97,20 +127,30 @@ public final class FacePresenceDetector: NSObject, AVCaptureVideoDataOutputSampl
         try configureSessionIfNeeded()
         
         return try await withCheckedThrowingContinuation { continuation in
-            captureQueue.async {
-                if let existing = self.activeContinuation {
-                    existing.resume(throwing: FaceDetectorError.captureFailed)
+            continuationLock.lock()
+            if let existing = self.activeContinuation {
+                self.activeContinuation = nil
+                existing.resume(throwing: FaceDetectorError.captureFailed)
+            }
+            self.activeContinuation = continuation
+            continuationLock.unlock()
+            
+            sessionQueue.async {
+                if !self.session.isRunning {
+                    self.session.startRunning()
                 }
-                self.activeContinuation = continuation
-                self.session.startRunning()
-                
-                // Timeout fallback
-                self.captureQueue.asyncAfter(deadline: .now() + 5) { [weak self] in
-                    guard let self = self, self.activeContinuation != nil else { return }
-                    let cont = self.activeContinuation
+            }
+            
+            // Timeout fallback
+            captureQueue.asyncAfter(deadline: .now() + 5) { [weak self] in
+                guard let self = self else { return }
+                self.continuationLock.lock()
+                if let cont = self.activeContinuation {
                     self.activeContinuation = nil
-                    self.session.stopRunning()
-                    cont?.resume(throwing: FaceDetectorError.captureFailed)
+                    self.continuationLock.unlock()
+                    cont.resume(throwing: FaceDetectorError.captureFailed)
+                } else {
+                    self.continuationLock.unlock()
                 }
             }
         }
@@ -119,10 +159,13 @@ public final class FacePresenceDetector: NSObject, AVCaptureVideoDataOutputSampl
     public func captureOutput(_ output: AVCaptureOutput,
                               didOutput sampleBuffer: CMSampleBuffer,
                               from connection: AVCaptureConnection) {
-        guard let continuation = activeContinuation else { return }
+        continuationLock.lock()
+        guard let continuation = activeContinuation else {
+            continuationLock.unlock()
+            return
+        }
         activeContinuation = nil
-        
-        session.stopRunning()
+        continuationLock.unlock()
         
         if let pb = CMSampleBufferGetImageBuffer(sampleBuffer) {
             continuation.resume(returning: pb)
