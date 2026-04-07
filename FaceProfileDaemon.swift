@@ -1,8 +1,8 @@
 // FaceProfileDaemon.swift
 // Compile binary:  make compile
 //
-// Requires FacePresenceDetector.swift and ProfileStateMachine.swift — the
-// Makefile compiles all three files together.
+// Requires FacePresenceDetector.swift, ProfileStateMachine.swift, and
+// FaceProfileEntry.swift — the Makefile compiles all four sources together.
 
 import Foundation
 import AVFoundation
@@ -11,6 +11,9 @@ import IOKit
 import IOKit.hid
 import os
 
+private let karabinerCLIPath =
+    "/Library/Application Support/org.pqrs/Karabiner-Elements/bin/karabiner_cli"
+
 // MARK: - FaceDetecting Protocol
 
 public protocol FaceDetecting {
@@ -18,6 +21,52 @@ public protocol FaceDetecting {
 }
 
 extension FacePresenceDetector: FaceDetecting {}
+
+// MARK: - Karabiner CLI seam
+
+enum KarabinerExecutionResult: Equatable {
+    case success
+    case timedOut
+    case nonZeroExit(Int32)
+    case launchFailed(String)
+}
+
+protocol KarabinerCLIExecuting: AnyObject {
+    func runSelectProfile(_ profile: String) -> KarabinerExecutionResult
+}
+
+final class DefaultKarabinerCLIExecutor: KarabinerCLIExecuting {
+    private let cliPath: String
+
+    init(cliPath: String = karabinerCLIPath) {
+        self.cliPath = cliPath
+    }
+
+    func runSelectProfile(_ profile: String) -> KarabinerExecutionResult {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: cliPath)
+        proc.arguments = ["--select-profile", profile]
+        proc.standardOutput = FileHandle.nullDevice
+
+        let semaphore = DispatchSemaphore(value: 0)
+        proc.terminationHandler = { _ in semaphore.signal() }
+
+        do {
+            try proc.run()
+            let result = semaphore.wait(timeout: .now() + 5.0)
+            if result == .timedOut {
+                proc.terminate()
+                return .timedOut
+            }
+            if proc.terminationStatus != 0 {
+                return .nonZeroExit(proc.terminationStatus)
+            }
+            return .success
+        } catch {
+            return .launchFailed(error.localizedDescription)
+        }
+    }
+}
 
 // MARK: - State Machine
 //
@@ -36,16 +85,6 @@ extension FacePresenceDetector: FaceDetecting {}
 //  │               reset to 0 on face detected OR built-in HID event       │
 //  │  Profile switches are skipped when cachedProfile == target (no-op)    │
 //  └──────────────────────────────────────────────────────────────────────┘
-
-// MARK: - Constants
-
-private let karabinerCLIPath =
-    "/Library/Application Support/org.pqrs/Karabiner-Elements/bin/karabiner_cli"
-// Must match Karabiner-Elements profile names exactly (case-sensitive, emoji included).
-private let profileKeyboard = "⌨️"
-private let profileGhost    = "👻"
-private let pollInterval: Double = 30    // seconds between face detection polls
-private let noFaceTimeout: Double = 120  // seconds before switching to 👻
 
 // MARK: - HID callback (top-level C-compatible function)
 //
@@ -69,18 +108,18 @@ private func fpdHIDInputCallback(
 // MARK: - Daemon
 
 final class FaceProfileDaemon {
+    private let profileKeyboard: String
+    private let profileGhost: String
+    private let pollInterval: Double
+    private let noFaceTimeout: Double
     private let detector: FaceDetecting
+    private let karabiner: KarabinerCLIExecuting
     private let logger = Logger(subsystem: "com.user.face-profile-daemon", category: "main")
 
     // State machine — pure logic extracted for testability.
     // Accessed from both the Swift concurrency poll task and the IOHIDManager
     // RunLoop callback. Synchronized via stateQueue.
-    private var stateMachine = ProfileStateMachine(
-        profileKeyboard: profileKeyboard,
-        profileGhost: profileGhost,
-        pollInterval: pollInterval,
-        noFaceTimeout: noFaceTimeout
-    )
+    private var stateMachine: ProfileStateMachine
     private let stateQueue = DispatchQueue(label: "com.facedetector.stateMachine")
     private let karabinerProcessQueue = DispatchQueue(label: "com.facedetector.karabinerCli", qos: .userInitiated)
 
@@ -93,8 +132,26 @@ final class FaceProfileDaemon {
     private var sigtermSource: DispatchSourceSignal?
     private var sigintSource: DispatchSourceSignal?
     
-    init(detector: FaceDetecting = FacePresenceDetector()) {
+    init(
+        detector: FaceDetecting = FacePresenceDetector(),
+        karabiner: KarabinerCLIExecuting = DefaultKarabinerCLIExecutor(),
+        profileKeyboard: String = "⌨️",
+        profileGhost: String = "👻",
+        pollInterval: Double = 30,
+        noFaceTimeout: Double = 120
+    ) {
         self.detector = detector
+        self.karabiner = karabiner
+        self.profileKeyboard = profileKeyboard
+        self.profileGhost = profileGhost
+        self.pollInterval = pollInterval
+        self.noFaceTimeout = noFaceTimeout
+        self.stateMachine = ProfileStateMachine(
+            profileKeyboard: profileKeyboard,
+            profileGhost: profileGhost,
+            pollInterval: pollInterval,
+            noFaceTimeout: noFaceTimeout
+        )
     }
 
     // MARK: - Entry
@@ -249,7 +306,7 @@ final class FaceProfileDaemon {
 
     // MARK: - Face detection poll loop (Swift concurrency Task)
 
-    private func faceDetectionLoop() async {
+    internal func faceDetectionLoop() async {
         var consecutiveFailures = 0
         var lastSleepTime = pollInterval
         while true {
@@ -318,42 +375,22 @@ final class FaceProfileDaemon {
         let capturedProfile = profile
         karabinerProcessQueue.async { [weak self] in
             guard let self else { return }
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: karabinerCLIPath)
-            proc.arguments = ["--select-profile", capturedProfile]
-            proc.standardOutput = FileHandle.nullDevice
-
-            let semaphore = DispatchSemaphore(value: 0)
-            proc.terminationHandler = { _ in semaphore.signal() }
-
-            do {
-                try proc.run()
-                let result = semaphore.wait(timeout: .now() + 5.0)
-                if result == .timedOut {
-                    proc.terminate()
-                    self.stateQueue.async {
-                        self.logger.error("[FPD] karabiner_cli timed out for '\(capturedProfile, privacy: .public)'")
-                        self.stateMachine.onSwitchFailed(forProfile: capturedProfile)
-                    }
-                } else if proc.terminationStatus != 0 {
-                    self.stateQueue.async {
-                        self.logger.error("[FPD] karabiner_cli failed (exit \(proc.terminationStatus)) for '\(capturedProfile, privacy: .public)'")
-                        self.stateMachine.onSwitchFailed(forProfile: capturedProfile)
-                    }
-                } else {
+            let result = self.karabiner.runSelectProfile(capturedProfile)
+            self.stateQueue.async {
+                switch result {
+                case .success:
                     self.logger.debug("[FPD] karabiner_cli succeeded for '\(capturedProfile, privacy: .public)'")
-                }
-            } catch {
-                self.stateQueue.async {
-                    self.logger.error("Failed to launch karabiner_cli: \(error.localizedDescription, privacy: .public)")
+                case .timedOut:
+                    self.logger.error("[FPD] karabiner_cli timed out for '\(capturedProfile, privacy: .public)'")
+                    self.stateMachine.onSwitchFailed(forProfile: capturedProfile)
+                case .nonZeroExit(let code):
+                    self.logger.error("[FPD] karabiner_cli failed (exit \(code)) for '\(capturedProfile, privacy: .public)'")
+                    self.stateMachine.onSwitchFailed(forProfile: capturedProfile)
+                case .launchFailed(let message):
+                    self.logger.error("Failed to launch karabiner_cli: \(message, privacy: .public)")
                     self.stateMachine.onSwitchFailed(forProfile: capturedProfile)
                 }
             }
         }
     }
 }
-
-// MARK: - Entry point
-
-let daemon = FaceProfileDaemon()
-daemon.run()

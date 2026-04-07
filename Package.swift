@@ -8,7 +8,11 @@ let package = Package(
         .target(
             name: "FaceProfileLib",
             path: ".",
-            sources: ["ProfileStateMachine.swift"]
+            sources: [
+                "ProfileStateMachine.swift",
+                "FaceProfileDaemon.swift",
+                "FacePresenceDetector.swift",
+            ]
         ),
         .testTarget(
             name: "FaceProfileTests",

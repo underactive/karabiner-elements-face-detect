@@ -8,9 +8,9 @@ LOG_ERR  = $(HOME)/Library/Logs/$(BIN).err.log
 
 .PHONY: compile test install uninstall logs
 
-## Build the binary from FaceProfileDaemon.swift + ProfileStateMachine.swift + FacePresenceDetector.swift (standalone canonical source; keep all three in swiftc).
-compile: FaceProfileDaemon.swift ProfileStateMachine.swift FacePresenceDetector.swift
-	swiftc -O FaceProfileDaemon.swift ProfileStateMachine.swift FacePresenceDetector.swift -o $(BIN)
+## Build the binary from FaceProfileDaemon.swift + ProfileStateMachine.swift + FacePresenceDetector.swift + FaceProfileEntry.swift (standalone canonical source; keep all four in swiftc).
+compile: FaceProfileDaemon.swift ProfileStateMachine.swift FacePresenceDetector.swift FaceProfileEntry.swift
+	swiftc -O FaceProfileDaemon.swift ProfileStateMachine.swift FacePresenceDetector.swift FaceProfileEntry.swift -o $(BIN)
 
 ## Run unit tests via Swift Package Manager.
 test:
