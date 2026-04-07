@@ -1,0 +1,5 @@
+face-profile-daemon
+
+.DS_Store
+*.o
+*.swp

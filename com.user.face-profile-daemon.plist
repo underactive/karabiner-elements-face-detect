@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.face-profile-daemon</string>
+
+    <!-- __HOME__ is replaced by 'make install' with the actual home directory -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/bin/face-profile-daemon</string>
+    </array>
+
+    <!-- Restart automatically on crash; wait at least 10 s before relaunch -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Start immediately when the LaunchAgent is loaded -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Redirect stdout/stderr to log files (no disk writes from the binary itself) -->
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/face-profile-daemon.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/face-profile-daemon.err.log</string>
+</dict>
+</plist>
