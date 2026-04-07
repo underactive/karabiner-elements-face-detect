@@ -9,6 +9,7 @@ import AVFoundation
 import Vision
 import IOKit
 import IOKit.hid
+import os
 
 // MARK: - FaceDetecting Protocol
 
@@ -69,6 +70,7 @@ private func fpdHIDInputCallback(
 
 final class FaceProfileDaemon {
     private let detector: FaceDetecting
+    private let logger = Logger(subsystem: "com.user.face-profile-daemon", category: "main")
 
     // State machine — pure logic extracted for testability.
     // Accessed from both the Swift concurrency poll task and the IOHIDManager
@@ -93,18 +95,18 @@ final class FaceProfileDaemon {
 
     func run() {
         if !FileManager.default.fileExists(atPath: karabinerCLIPath) {
-            stderr("[FPD] Critical error: karabiner_cli not found at \(karabinerCLIPath)")
+            logger.critical("karabiner_cli not found at \(karabinerCLIPath, privacy: .public)")
             exit(1)
         }
 
         builtinLocationIDs = enumerateBuiltinSPILocationIDs()
-        stderr("[FPD] Built-in SPI HID location IDs: \(builtinLocationIDs)")
+        logger.info("Built-in SPI HID location IDs: \(self.builtinLocationIDs.description, privacy: .public)")
 
         installHIDMonitor()
 
         Task { await faceDetectionLoop() }
 
-        stderr("[FPD] Daemon started — poll every \(Int(pollInterval))s, ghost after \(Int(noFaceTimeout))s no-face")
+        logger.info("Daemon started — poll every \(Int(pollInterval))s, ghost after \(Int(noFaceTimeout))s no-face")
         RunLoop.main.run()
     }
 
@@ -151,7 +153,7 @@ final class FaceProfileDaemon {
         if kr != kIOReturnSuccess {
             // HID monitoring is non-functional: noFaceStreak will not reset on
             // keyboard/trackpad activity; only face-detection polls drive state.
-            stderr("[FPD] Warning: IOHIDManager open returned 0x\(String(kr, radix: 16))")
+            logger.warning("IOHIDManager open returned 0x\(String(kr, radix: 16), privacy: .public)")
         }
         hidManager = mgr
     }
@@ -184,17 +186,17 @@ final class FaceProfileDaemon {
                     stateQueue.async {
                         let action = self.stateMachine.onFaceDetected()
                         self.handleAction(action)
-                        self.stderr("[FPD] Face detected → \(profileKeyboard)")
+                        self.logger.info("Face detected → \(profileKeyboard, privacy: .public)")
                     }
                 } else {
                     stateQueue.async {
                         let action = self.stateMachine.onNoFace()
-                        self.stderr("[FPD] No face. Streak: \(Int(self.stateMachine.noFaceStreak))s / \(Int(noFaceTimeout))s")
+                        self.logger.info("No face. Streak: \(Int(self.stateMachine.noFaceStreak))s / \(Int(noFaceTimeout))s")
                         self.handleAction(action)
                     }
                 }
             } catch {
-                stderr("[FPD] Detection error: \(error.localizedDescription)")
+                logger.error("Detection error: \(error.localizedDescription, privacy: .public)")
             }
             try? await Task.sleep(for: .seconds(pollInterval))
         }
@@ -204,7 +206,7 @@ final class FaceProfileDaemon {
 
     private func handleAction(_ action: ProfileStateMachine.Action) {
         if case .switchProfile(let profile) = action {
-            stderr("[FPD] Switching to '\(profile)'")
+            logger.info("Switching to '\(profile, privacy: .public)'")
             executeProfileSwitch(profile)
         }
     }
@@ -219,7 +221,7 @@ final class FaceProfileDaemon {
         proc.terminationHandler = { [weak self] p in
             if p.terminationStatus != 0 {
                 self?.stateQueue.async {
-                    self?.stderr("[FPD] karabiner_cli exit \(p.terminationStatus) for '\(capturedProfile)'")
+                    self?.logger.error("karabiner_cli exit \(p.terminationStatus) for '\(capturedProfile, privacy: .public)'")
                     self?.stateMachine.onSwitchFailed()
                 }
             }
@@ -229,14 +231,10 @@ final class FaceProfileDaemon {
             try proc.run()
         } catch {
             stateQueue.async {
-                self.stderr("[FPD] Failed to launch karabiner_cli: \(error)")
+                self.logger.error("Failed to launch karabiner_cli: \(error.localizedDescription, privacy: .public)")
                 self.stateMachine.onSwitchFailed()
             }
         }
-    }
-
-    private func stderr(_ msg: String) {
-        fputs("\(msg)\n", Foundation.stderr)
     }
 }
 
