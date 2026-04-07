@@ -64,31 +64,33 @@ public final class FacePresenceDetector: NSObject, AVCaptureVideoDataOutputSampl
     }
 
     private func configureSessionIfNeeded() throws {
-        guard !isConfigured else { return }
-        
-        guard let device = AVCaptureDevice.default(for: .video) else {
-            throw FaceDetectorError.cameraUnavailable
+        try captureQueue.sync {
+            guard !isConfigured else { return }
+
+            guard let device = AVCaptureDevice.default(for: .video) else {
+                throw FaceDetectorError.cameraUnavailable
+            }
+
+            session.sessionPreset = .medium
+
+            do {
+                let input = try AVCaptureDeviceInput(device: device)
+                guard session.canAddInput(input) else { throw FaceDetectorError.cameraUnavailable }
+                session.addInput(input)
+            } catch {
+                throw FaceDetectorError.cameraUnavailable
+            }
+
+            let output = AVCaptureVideoDataOutput()
+            output.alwaysDiscardsLateVideoFrames = true
+            output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+            guard session.canAddOutput(output) else { throw FaceDetectorError.cameraUnavailable }
+            session.addOutput(output)
+
+            output.setSampleBufferDelegate(self, queue: captureQueue)
+
+            isConfigured = true
         }
-        
-        session.sessionPreset = .medium
-        
-        do {
-            let input = try AVCaptureDeviceInput(device: device)
-            guard session.canAddInput(input) else { throw FaceDetectorError.cameraUnavailable }
-            session.addInput(input)
-        } catch {
-            throw FaceDetectorError.cameraUnavailable
-        }
-        
-        let output = AVCaptureVideoDataOutput()
-        output.alwaysDiscardsLateVideoFrames = true
-        output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
-        guard session.canAddOutput(output) else { throw FaceDetectorError.cameraUnavailable }
-        session.addOutput(output)
-        
-        output.setSampleBufferDelegate(self, queue: captureQueue)
-        
-        isConfigured = true
     }
 
     private func captureSingleFrame() async throws -> CVPixelBuffer {
