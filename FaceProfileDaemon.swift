@@ -10,6 +10,7 @@ import Vision
 import IOKit
 import IOKit.hid
 import Security
+import AppKit
 import os
 
 private let karabinerCLIPath =
@@ -34,6 +35,11 @@ private func verifyCodeSignature(atPath path: String) -> Bool {
 
 public protocol FaceDetecting {
     func detectFace() async throws -> Bool
+    func invalidateSession()
+}
+
+extension FaceDetecting {
+    public func invalidateSession() {} // default no-op for test doubles
 }
 
 extension FacePresenceDetector: FaceDetecting {}
@@ -140,7 +146,7 @@ private func fpdHIDInputCallback(
 
 // MARK: - Daemon
 
-final class FaceProfileDaemon {
+final class FaceProfileDaemon: @unchecked Sendable {
     private let profileKeyboard: String
     private let profileGhost: String
     private let pollInterval: Double
@@ -210,6 +216,14 @@ final class FaceProfileDaemon {
 
         detectionTask = Task { await faceDetectionLoop() }
 
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleSystemWake()
+        }
+
         signal(SIGTERM, SIG_IGN)
         let sigterm = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
         sigterm.setEventHandler { [weak self] in
@@ -252,6 +266,17 @@ final class FaceProfileDaemon {
         }
         hidThread?.cancel()
         hidThread = nil
+    }
+
+    // MARK: - Sleep/Wake
+
+    private func handleSystemWake() {
+        logger.info("System woke from sleep — reinitializing camera session")
+        detector.invalidateSession()
+        // Cancel the current loop (which may be deep in exponential backoff)
+        // and restart fresh so the next poll happens immediately.
+        detectionTask?.cancel()
+        detectionTask = Task { await faceDetectionLoop() }
     }
 
     // MARK: - IOKit: enumerate built-in SPI device location IDs (once at startup)
@@ -371,8 +396,9 @@ final class FaceProfileDaemon {
                         self.logger.info("Face detected → \(self.profileKeyboard, privacy: .public)")
                     }
                 } else {
+                    let elapsed = lastSleepTime
                     stateQueue.async {
-                        let action = self.stateMachine.onNoFace(elapsed: lastSleepTime)
+                        let action = self.stateMachine.onNoFace(elapsed: elapsed)
                         self.handleAction(action)
                         self.logger.info("No face. Streak: \(Int(self.stateMachine.noFaceStreak))s / \(Int(self.noFaceTimeout))s")
                     }
@@ -382,8 +408,9 @@ final class FaceProfileDaemon {
                 let nsError = error as NSError
                 logger.error("Detection error: \(error.localizedDescription, privacy: .public) (domain: \(nsError.domain, privacy: .public), code: \(nsError.code, privacy: .public))")
                 if consecutiveFailures >= 5 {
+                    let elapsed = lastSleepTime
                     stateQueue.async {
-                        let action = self.stateMachine.onNoFace(elapsed: lastSleepTime)
+                        let action = self.stateMachine.onNoFace(elapsed: elapsed)
                         self.handleAction(action)
                     }
                 }

@@ -26,7 +26,7 @@ public enum FaceDetectorError: Error, LocalizedError {
 /// Opens a one-shot AVCaptureSession, grabs a single frame, runs
 /// VNDetectFaceRectanglesRequest on the in-memory pixel buffer, then
 /// closes the session. No data is ever written to disk.
-public final class FacePresenceDetector: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+public final class FacePresenceDetector: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @unchecked Sendable {
     private let session = AVCaptureSession()
     private let captureQueue = DispatchQueue(label: "com.facedetector.capture", qos: .userInitiated)
     private let sessionQueue = DispatchQueue(label: "com.facedetector.session", qos: .userInitiated)
@@ -41,24 +41,42 @@ public final class FacePresenceDetector: NSObject, AVCaptureVideoDataOutputSampl
         super.init()
     }
 
+    /// Tears down the capture session so the next `detectFace()` call
+    /// re-configures from scratch.  Call after system wake — the OS
+    /// suspends the camera device during sleep, leaving the session with
+    /// stale hardware references.
+    public func invalidateSession() {
+        sessionQueue.sync {
+            guard isConfigured else { return }
+            session.stopRunning()
+            session.beginConfiguration()
+            for input in session.inputs { session.removeInput(input) }
+            for output in session.outputs { session.removeOutput(output) }
+            session.commitConfiguration()
+            isConfigured = false
+        }
+    }
+
+    private func beginDetection() throws {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard !isDetecting else { throw FaceDetectorError.captureFailed }
+        isDetecting = true
+    }
+
+    private func endDetection() {
+        stateLock.lock()
+        isDetecting = false
+        stateLock.unlock()
+    }
+
     /// Returns `true` if ≥1 face with confidence ≥ 0.5 is detected in the
     /// current camera frame. Throws `FaceDetectorError` on any camera or
     /// Vision failure — never silently returns `false`.
     public func detectFace() async throws -> Bool {
-        stateLock.lock()
-        guard !isDetecting else {
-            stateLock.unlock()
-            throw FaceDetectorError.captureFailed
-        }
-        isDetecting = true
-        stateLock.unlock()
-        
-        defer {
-            stateLock.lock()
-            isDetecting = false
-            stateLock.unlock()
-        }
-        
+        try beginDetection()
+        defer { endDetection() }
+
         try await requestAccess()
         let sampleBuffer = try await captureSingleFrame()
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {

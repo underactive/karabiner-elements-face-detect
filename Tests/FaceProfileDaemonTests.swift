@@ -24,6 +24,7 @@ final class MockFaceDetector: FaceDetecting {
 }
 
 final class MockKarabiner: KarabinerCLIExecuting {
+    let cliPath: String = "/usr/bin/true"
     private let lock = NSLock()
     private(set) var profiles: [String] = []
     var result: KarabinerExecutionResult = .success
