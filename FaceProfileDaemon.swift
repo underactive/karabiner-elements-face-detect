@@ -108,7 +108,7 @@ final class DefaultKarabinerCLIExecutor: KarabinerCLIExecuting {
 //  │         built-in HID event ─────────────────────────────────┤         │
 //  │                                                              ▼         │
 //  │   ┌──────────────────┐                          ┌──────────────────┐  │
-//  │   │   👻  ghostActive │◀─── noFaceStreak ≥ 120s ─┤  ⌨️  kbdActive  │  │
+//  │   │   👻  ghostActive │◀─── noFaceStreak ≥ 300s ─┤  ⌨️  kbdActive  │  │
 //  │   │  (profile: 👻)   │                          │  (profile: ⌨️)  │  │
 //  │   └──────────────────┘                          └──────────────────┘  │
 //  │                                                                        │
@@ -150,6 +150,7 @@ final class FaceProfileDaemon: @unchecked Sendable {
     private let profileKeyboard: String
     private let profileGhost: String
     private let pollInterval: Double
+    private let noFacePollInterval: Double
     private let noFaceTimeout: Double
     private let detector: FaceDetecting
     private let karabiner: KarabinerCLIExecuting
@@ -180,13 +181,15 @@ final class FaceProfileDaemon: @unchecked Sendable {
         profileKeyboard: String = "⌨️",
         profileGhost: String = "👻",
         pollInterval: Double = 60,
-        noFaceTimeout: Double = 120
+        noFacePollInterval: Double = 15,
+        noFaceTimeout: Double = 300
     ) {
         self.detector = detector
         self.karabiner = karabiner
         self.profileKeyboard = profileKeyboard
         self.profileGhost = profileGhost
         self.pollInterval = pollInterval
+        self.noFacePollInterval = noFacePollInterval
         self.noFaceTimeout = noFaceTimeout
         self.stateMachine = ProfileStateMachine(
             profileKeyboard: profileKeyboard,
@@ -248,7 +251,7 @@ final class FaceProfileDaemon: @unchecked Sendable {
         sigint.resume()
         self.sigintSource = sigint
 
-        logger.info("Daemon started — poll every \(Int(self.pollInterval))s, ghost after \(Int(self.noFaceTimeout))s no-face")
+        logger.info("Daemon started — poll \(Int(self.noFacePollInterval))s (no face) / \(Int(self.pollInterval))s (face present), ghost after \(Int(self.noFaceTimeout))s no-face")
         CFRunLoopRun()
     }
 
@@ -383,12 +386,14 @@ final class FaceProfileDaemon: @unchecked Sendable {
 
     internal func faceDetectionLoop() async {
         var consecutiveFailures = 0
-        var lastSleepTime = pollInterval
+        var lastSleepTime = noFacePollInterval
+        var lastDetectedFace = false
         while true {
             if Task.isCancelled { break }
             do {
                 let detected = try await detector.detectFace()
                 consecutiveFailures = 0
+                lastDetectedFace = detected
                 if detected {
                     stateQueue.async {
                         let action = self.stateMachine.onFaceDetected()
@@ -405,6 +410,7 @@ final class FaceProfileDaemon: @unchecked Sendable {
                 }
             } catch {
                 consecutiveFailures += 1
+                lastDetectedFace = false
                 let nsError = error as NSError
                 logger.error("Detection error: \(error.localizedDescription, privacy: .public) (domain: \(nsError.domain, privacy: .public), code: \(nsError.code, privacy: .public))")
                 if consecutiveFailures >= 5 {
@@ -415,15 +421,16 @@ final class FaceProfileDaemon: @unchecked Sendable {
                     }
                 }
             }
-            
+
             let sleepTime: Double
             if consecutiveFailures >= 5 {
                 let backoffMultiplier = pow(2.0, Double(min(consecutiveFailures - 5, 8)))
                 sleepTime = min(300.0, pollInterval * backoffMultiplier)
             } else {
-                sleepTime = pollInterval
+                sleepTime = lastDetectedFace ? pollInterval : noFacePollInterval
             }
             lastSleepTime = sleepTime
+            logger.info("Next check in \(Int(sleepTime))s (\(lastDetectedFace ? "face present" : "no face", privacy: .public))")
             
             do {
                 try await Task.sleep(for: .seconds(sleepTime))

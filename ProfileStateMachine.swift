@@ -20,7 +20,7 @@ public struct ProfileStateMachine {
         profileKeyboard: String = "⌨️",
         profileGhost: String = "👻",
         pollInterval: Double = 30,
-        noFaceTimeout: Double = 120
+        noFaceTimeout: Double = 300
     ) {
         self.profileKeyboard = profileKeyboard
         self.profileGhost = profileGhost
