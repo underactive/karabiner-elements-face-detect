@@ -378,13 +378,11 @@ final class FaceProfileDaemon: @unchecked Sendable {
               builtinLocationIDs.contains(n.intValue) else {
             return  // event from a non-built-in device (or missing location ID); discard
         }
-        stateQueue.async {
-            let now = CFAbsoluteTimeGetCurrent()
-            if now - self.lastHIDEventTime < 2.0 {
-                return
-            }
-            self.lastHIDEventTime = now
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastHIDEventTime >= 2.0 else { return }
+        lastHIDEventTime = now
 
+        stateQueue.async {
             let action = self.stateMachine.onHIDEvent()
             self.handleAction(action)
         }
@@ -462,8 +460,7 @@ final class FaceProfileDaemon: @unchecked Sendable {
     }
 
     private func executeProfileSwitch(_ profile: String) {
-        let allowed: Set<String> = [profileKeyboard, profileGhost]
-        guard allowed.contains(profile) else {
+        guard profile == profileKeyboard || profile == profileGhost else {
             logger.error("Rejected unexpected profile name: '\(profile, privacy: .public)'")
             return
         }
