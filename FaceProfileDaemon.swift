@@ -16,19 +16,64 @@ import os
 private let karabinerCLIPath =
     "/Library/Application Support/org.pqrs/Karabiner-Elements/bin/karabiner_cli"
 
+// Pinned designated requirement for karabiner_cli: Developer ID-signed,
+// identifier "karabiner_cli", Karabiner-Elements team OU (G43BCU2T37).
+// Produced verbatim by `codesign -d -r-` on the official binary — do not
+// loosen without re-running that command and confirming the new output.
+private let karabinerCLIRequirement =
+    "identifier \"karabiner_cli\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = G43BCU2T37"
+
+private func karabinerRequirement() -> SecRequirement? {
+    var requirement: SecRequirement?
+    guard SecRequirementCreateWithString(karabinerCLIRequirement as CFString, [], &requirement) == errSecSuccess else {
+        return nil
+    }
+    return requirement
+}
+
+private func strictCheckFlags() -> SecCSFlags {
+    SecCSFlags(rawValue: UInt32(kSecCSStrictValidate) | UInt32(kSecCSCheckAllArchitectures) | UInt32(kSecCSCheckNestedCode))
+}
+
 private func verifyCodeSignature(atPath path: String) -> Bool {
     let url = URL(fileURLWithPath: path) as CFURL
     var staticCode: SecStaticCode?
-    guard SecStaticCodeCreateWithPath(url, SecCSFlags(), &staticCode) == errSecSuccess,
-          let code = staticCode else {
+    guard SecStaticCodeCreateWithPath(url, [], &staticCode) == errSecSuccess,
+          let code = staticCode,
+          let req = karabinerRequirement() else {
         return false
     }
-    var requirement: SecRequirement?
-    guard SecRequirementCreateWithString("anchor apple generic" as CFString, SecCSFlags(), &requirement) == errSecSuccess,
-          let req = requirement else {
-        return false
+    return SecStaticCodeCheckValidityWithErrors(code, strictCheckFlags(), req, nil) == errSecSuccess
+}
+
+// Best-effort post-launch verification of a running subprocess. Closes the
+// TOCTOU window between path-based verification and execve. If the kernel
+// cannot return a code object (e.g., process already exited, or missing
+// task introspection rights) we fall back to trusting the earlier path
+// verification — we only hard-fail on an *actual* signature mismatch.
+//
+// Note: kSecCSStrictValidate / kSecCSCheckAllArchitectures / kSecCSCheckNestedCode
+// are static-code-only flags (per SecCode.h). Passing them to SecCodeCheckValidity
+// on a running SecCode object returns a non-success OSStatus rather than validating.
+// For running-process validation we must use default flags (0).
+private enum RunningProcessVerification {
+    case ok
+    case mismatch(OSStatus)
+}
+
+private func verifyRunningProcess(pid: pid_t) -> RunningProcessVerification {
+    var guestAttrs = [String: Any]()
+    guestAttrs[kSecGuestAttributePid as String] = Int(pid)
+    var code: SecCode?
+    let copyStatus = SecCodeCopyGuestWithAttributes(nil, guestAttrs as CFDictionary, [], &code)
+    guard copyStatus == errSecSuccess, let runningCode = code else {
+        return .ok
     }
-    return SecStaticCodeCheckValidityWithErrors(code, SecCSFlags(), req, nil) == errSecSuccess
+    guard let req = karabinerRequirement() else {
+        return .ok
+    }
+    let checkStatus = SecCodeCheckValidity(runningCode, [], req)
+    return checkStatus == errSecSuccess ? .ok : .mismatch(checkStatus)
 }
 
 // MARK: - FaceDetecting Protocol
@@ -60,30 +105,44 @@ protocol KarabinerCLIExecuting: AnyObject {
 
 final class DefaultKarabinerCLIExecutor: KarabinerCLIExecuting {
     let cliPath: String
-    private var isVerified = false
 
     init(cliPath: String = karabinerCLIPath) {
         self.cliPath = cliPath
     }
 
     func runSelectProfile(_ profile: String) -> KarabinerExecutionResult {
-        if !isVerified {
-            guard verifyCodeSignature(atPath: cliPath) else {
-                return .launchFailed("Code signature verification failed for \(cliPath)")
-            }
-            isVerified = true
+        // Reject profile names that could be misinterpreted as CLI flags by karabiner_cli.
+        if profile.hasPrefix("-") {
+            return .launchFailed("Invalid profile name: must not start with '-'")
+        }
+        // Re-verify on every call: caching verification across calls opens a TOCTOU window
+        // where an attacker can swap the binary after the first check succeeds.
+        guard verifyCodeSignature(atPath: cliPath) else {
+            return .launchFailed("Code signature verification failed for \(cliPath)")
         }
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: cliPath)
         proc.arguments = ["--select-profile", profile]
         proc.standardOutput = FileHandle.nullDevice
         proc.standardError = FileHandle.nullDevice
+        // Minimal subprocess environment — no DYLD_*, no inherited locale, nothing else
+        // the parent's env might carry. HOME is needed because karabiner_cli reads
+        // user config from ~/.config/karabiner/.
+        proc.environment = [
+            "PATH": "/usr/bin:/bin",
+            "HOME": NSHomeDirectory()
+        ]
 
         let semaphore = DispatchSemaphore(value: 0)
         proc.terminationHandler = { _ in semaphore.signal() }
 
         do {
             try proc.run()
+            if case .mismatch(let status) = verifyRunningProcess(pid: proc.processIdentifier) {
+                proc.terminate()
+                proc.waitUntilExit()
+                return .launchFailed("Running process signature verification failed (OSStatus \(status))")
+            }
             let result = semaphore.wait(timeout: .now() + 5.0)
             if result == .timedOut {
                 proc.terminate()
@@ -147,6 +206,21 @@ private func fpdHIDInputCallback(
 
 // MARK: - Daemon
 
+// @unchecked Sendable contract — synchronization invariants per mutable member:
+//   • stateMachine         — always accessed inside stateQueue.async/sync
+//   • lastHIDEventTime     — read/written only on the HID RunLoop thread
+//                            (IOHIDManager callback), serialized by the run loop
+//   • hidManager, hidThread, hidRunLoop, hidContext, hidContextPtr
+//                          — written once during installHIDMonitor() (main), read
+//                            by shutdown() (main/signal source queue). Signal
+//                            source and main share the .main queue, so accesses
+//                            are serialized there.
+//   • builtinLocationIDs   — written once at startup before HID monitor installs,
+//                            read-only thereafter
+//   • detectionTask        — owned by main-queue signal handler and handleSystemWake
+//                            (also on .main); single-writer pattern
+//   • sigtermSource, sigintSource — set once on main during run()
+// If any new mutable member is added, document its queue/lock here before using it.
 final class FaceProfileDaemon: @unchecked Sendable {
     private static let builtinTransports = ["SPI", "AppleHID", "Internal"]
     private static let backoffThreshold = 5

@@ -6,10 +6,11 @@
     <key>Label</key>
     <string>com.user.face-profile-daemon</string>
 
-    <!-- __HOME__ is replaced by 'make install' with the actual home directory -->
+    <!-- ProgramArguments.0 is overwritten by 'make install' via plutil -replace
+         with the absolute path to the installed binary. -->
     <key>ProgramArguments</key>
     <array>
-        <string>__HOME__/.local/bin/face-profile-daemon</string>
+        <string>/REPLACED_BY_MAKE_INSTALL/face-profile-daemon</string>
     </array>
 
     <!-- Restart automatically on crash; wait at least 10 s before relaunch -->
