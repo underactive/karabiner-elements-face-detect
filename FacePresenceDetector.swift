@@ -33,7 +33,12 @@ public final class FacePresenceDetector: NSObject, AVCaptureVideoDataOutputSampl
     private var isConfigured = false
     private var activeContinuation: CheckedContinuation<CMSampleBuffer, Error>?
     private let continuationLock = NSLock()
-    
+
+    /// Number of initial frames to discard while the camera ISP warms up.
+    /// The first ~2 frames are pitch-black (zero exposure); frame 3+ are usable.
+    private static let warmupFrames = 3
+    private var framesReceived = 0
+
     private var isDetecting = false
     private let stateLock = NSLock()
 
@@ -159,6 +164,7 @@ public final class FacePresenceDetector: NSObject, AVCaptureVideoDataOutputSampl
                 existing.resume(throwing: FaceDetectorError.captureFailed)
             }
             self.activeContinuation = continuation
+            self.framesReceived = 0
             continuationLock.unlock()
             
             sessionQueue.async {
@@ -189,6 +195,11 @@ public final class FacePresenceDetector: NSObject, AVCaptureVideoDataOutputSampl
         guard let continuation = activeContinuation else {
             continuationLock.unlock()
             return
+        }
+        framesReceived += 1
+        guard framesReceived > Self.warmupFrames else {
+            continuationLock.unlock()
+            return  // discard black frames while ISP auto-exposure ramps up
         }
         activeContinuation = nil
         continuationLock.unlock()
