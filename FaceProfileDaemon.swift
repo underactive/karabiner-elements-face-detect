@@ -148,6 +148,13 @@ private func fpdHIDInputCallback(
 // MARK: - Daemon
 
 final class FaceProfileDaemon: @unchecked Sendable {
+    private static let builtinTransports = ["SPI", "AppleHID", "Internal"]
+    private static let backoffThreshold = 5
+    private static let maxBackoffExponent = 8
+    private static let maxBackoffSeconds = 300.0
+    private static let permanentFailureThreshold = 50
+    private static let hidEventThrottleSeconds: CFAbsoluteTime = 2.0
+
     private let profileKeyboard: String
     private let profileGhost: String
     private let pollInterval: Double
@@ -203,6 +210,25 @@ final class FaceProfileDaemon: @unchecked Sendable {
     // MARK: - Entry
 
     func run() {
+        validateCLI()
+
+        builtinLocationIDs = enumerateBuiltinSPILocationIDs()
+        logger.info("Built-in SPI HID location IDs: \(self.builtinLocationIDs.description, privacy: .public)")
+        if builtinLocationIDs.isEmpty {
+            logger.warning("No built-in SPI devices found — HID activity detection will be disabled")
+        }
+
+        installHIDMonitor()
+        detectionTask = Task { await faceDetectionLoop() }
+        installWakeObserver()
+        self.sigtermSource = installSignalHandler(signal: SIGTERM, name: "SIGTERM")
+        self.sigintSource = installSignalHandler(signal: SIGINT, name: "SIGINT")
+
+        logger.info("Daemon started — poll \(Int(self.noFacePollInterval))s (no face) / \(Int(self.pollInterval))s (face present), ghost after \(Int(self.noFaceTimeout))s no-face")
+        CFRunLoopRun()
+    }
+
+    private func validateCLI() {
         let cliPath = karabiner.cliPath
         if !FileManager.default.fileExists(atPath: cliPath) {
             logger.critical("karabiner_cli not found at \(cliPath, privacy: .public)")
@@ -212,17 +238,9 @@ final class FaceProfileDaemon: @unchecked Sendable {
             logger.critical("karabiner_cli at \(cliPath, privacy: .public) failed code signature verification")
             exit(1)
         }
+    }
 
-        builtinLocationIDs = enumerateBuiltinSPILocationIDs()
-        logger.info("Built-in SPI HID location IDs: \(self.builtinLocationIDs.description, privacy: .public)")
-        if builtinLocationIDs.isEmpty {
-            logger.warning("No built-in SPI devices found — HID activity detection will be disabled")
-        }
-
-        installHIDMonitor()
-
-        detectionTask = Task { await faceDetectionLoop() }
-
+    private func installWakeObserver() {
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification,
             object: nil,
@@ -230,33 +248,6 @@ final class FaceProfileDaemon: @unchecked Sendable {
         ) { [weak self] _ in
             self?.handleSystemWake()
         }
-
-        signal(SIGTERM, SIG_IGN)
-        let sigterm = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
-        sigterm.setEventHandler { [weak self] in
-            self?.logger.info("Received SIGTERM, shutting down...")
-            self?.detectionTask?.cancel()
-            self?.karabinerProcessQueue.sync {}
-            self?.shutdown()
-            CFRunLoopStop(CFRunLoopGetMain())
-        }
-        sigterm.resume()
-        self.sigtermSource = sigterm
-
-        signal(SIGINT, SIG_IGN)
-        let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-        sigint.setEventHandler { [weak self] in
-            self?.logger.info("Received SIGINT, shutting down...")
-            self?.detectionTask?.cancel()
-            self?.karabinerProcessQueue.sync {}
-            self?.shutdown()
-            CFRunLoopStop(CFRunLoopGetMain())
-        }
-        sigint.resume()
-        self.sigintSource = sigint
-
-        logger.info("Daemon started — poll \(Int(self.noFacePollInterval))s (no face) / \(Int(self.pollInterval))s (face present), ghost after \(Int(self.noFaceTimeout))s no-face")
-        CFRunLoopRun()
     }
 
     func shutdown() {
@@ -279,6 +270,22 @@ final class FaceProfileDaemon: @unchecked Sendable {
         hidThread = nil
     }
 
+    // MARK: - Signal handling
+
+    private func installSignalHandler(signal sig: Int32, name: String) -> DispatchSourceSignal {
+        signal(sig, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+        source.setEventHandler { [weak self] in
+            self?.logger.info("Received \(name, privacy: .public), shutting down...")
+            self?.detectionTask?.cancel()
+            self?.karabinerProcessQueue.sync {}
+            self?.shutdown()
+            CFRunLoopStop(CFRunLoopGetMain())
+        }
+        source.resume()
+        return source
+    }
+
     // MARK: - Sleep/Wake
 
     private func handleSystemWake() {
@@ -294,8 +301,7 @@ final class FaceProfileDaemon: @unchecked Sendable {
 
     private func enumerateBuiltinSPILocationIDs() -> Set<Int> {
         var ids = Set<Int>()
-        let transports = ["SPI", "AppleHID", "Internal"]
-        for transport in transports {
+        for transport in Self.builtinTransports {
             let matching = NSMutableDictionary()
             matching["IOProviderClass"] = "IOHIDDevice"
             matching[kIOHIDTransportKey as String] = transport
@@ -322,8 +328,7 @@ final class FaceProfileDaemon: @unchecked Sendable {
 
     private func installHIDMonitor() {
         let mgr = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
-        let transports = ["SPI", "AppleHID", "Internal"]
-        let matches = transports.map { ["IOProviderClass": "IOHIDDevice", kIOHIDTransportKey as String: $0] }
+        let matches = Self.builtinTransports.map { ["IOProviderClass": "IOHIDDevice", kIOHIDTransportKey as String: $0] }
         IOHIDManagerSetDeviceMatchingMultiple(mgr, matches as CFArray)
 
         let contextObj = HIDContext(self, builtinLocationIDs: self.builtinLocationIDs)
@@ -379,7 +384,7 @@ final class FaceProfileDaemon: @unchecked Sendable {
             return  // event from a non-built-in device (or missing location ID); discard
         }
         let now = CFAbsoluteTimeGetCurrent()
-        guard now - lastHIDEventTime >= 2.0 else { return }
+        guard now - lastHIDEventTime >= Self.hidEventThrottleSeconds else { return }
         lastHIDEventTime = now
 
         stateQueue.async {
@@ -400,53 +405,64 @@ final class FaceProfileDaemon: @unchecked Sendable {
                 let detected = try await detector.detectFace()
                 consecutiveFailures = 0
                 lastDetectedFace = detected
-                if detected {
-                    stateQueue.async {
-                        self.logger.info("Face detected → \(self.profileKeyboard, privacy: .public)")
-                        let action = self.stateMachine.onFaceDetected()
-                        self.handleAction(action)
-                    }
-                } else {
-                    let elapsed = lastSleepTime
-                    stateQueue.async {
-                        let action = self.stateMachine.onNoFace(elapsed: elapsed)
-                        self.handleAction(action)
-                        self.logger.info("No face. Streak: \(Int(self.stateMachine.noFaceStreak))s / \(Int(self.noFaceTimeout))s")
-                    }
-                }
+                processDetectionResult(detected: detected, lastSleepTime: lastSleepTime)
             } catch {
                 consecutiveFailures += 1
                 lastDetectedFace = false
-                let nsError = error as NSError
-                logger.error("Detection error: \(error.localizedDescription, privacy: .public) (domain: \(nsError.domain, privacy: .public), code: \(nsError.code, privacy: .public))")
-                if consecutiveFailures >= 5 {
-                    let elapsed = lastSleepTime
-                    stateQueue.async {
-                        let action = self.stateMachine.onNoFace(elapsed: elapsed)
-                        self.handleAction(action)
-                    }
-                }
+                processDetectionError(error, consecutiveFailures: consecutiveFailures, lastSleepTime: lastSleepTime)
             }
 
-            let sleepTime: Double
-            if consecutiveFailures >= 5 {
-                if consecutiveFailures == 50 {
-                    logger.critical("Camera appears permanently unavailable after \(consecutiveFailures) consecutive failures")
-                }
-                let backoffMultiplier = pow(2.0, Double(min(consecutiveFailures - 5, 8)))
-                sleepTime = min(300.0, pollInterval * backoffMultiplier * Double.random(in: 0.5...1.5))
-            } else {
-                sleepTime = lastDetectedFace ? pollInterval : noFacePollInterval
-            }
+            let sleepTime = computeSleepInterval(consecutiveFailures: consecutiveFailures, lastDetectedFace: lastDetectedFace)
             lastSleepTime = sleepTime
             logger.info("Next check in \(Int(sleepTime))s (\(lastDetectedFace ? "face present" : "no face", privacy: .public))")
-            
+
             do {
                 try await Task.sleep(for: .seconds(sleepTime))
             } catch {
                 logger.debug("Face detection loop cancelled: \(error.localizedDescription, privacy: .public)")
                 break
             }
+        }
+    }
+
+    private func processDetectionResult(detected: Bool, lastSleepTime: Double) {
+        if detected {
+            stateQueue.async {
+                self.logger.info("Face detected → \(self.profileKeyboard, privacy: .public)")
+                let action = self.stateMachine.onFaceDetected()
+                self.handleAction(action)
+            }
+        } else {
+            let elapsed = lastSleepTime
+            stateQueue.async {
+                let action = self.stateMachine.onNoFace(elapsed: elapsed)
+                self.handleAction(action)
+                self.logger.info("No face. Streak: \(Int(self.stateMachine.noFaceStreak))s / \(Int(self.noFaceTimeout))s")
+            }
+        }
+    }
+
+    private func processDetectionError(_ error: Error, consecutiveFailures: Int, lastSleepTime: Double) {
+        let nsError = error as NSError
+        logger.error("Detection error: \(error.localizedDescription, privacy: .public) (domain: \(nsError.domain, privacy: .public), code: \(nsError.code, privacy: .public))")
+        if consecutiveFailures >= Self.backoffThreshold {
+            let elapsed = lastSleepTime
+            stateQueue.async {
+                let action = self.stateMachine.onNoFace(elapsed: elapsed)
+                self.handleAction(action)
+            }
+        }
+    }
+
+    private func computeSleepInterval(consecutiveFailures: Int, lastDetectedFace: Bool) -> Double {
+        if consecutiveFailures >= Self.backoffThreshold {
+            if consecutiveFailures == Self.permanentFailureThreshold {
+                logger.critical("Camera appears permanently unavailable after \(consecutiveFailures) consecutive failures")
+            }
+            let backoffMultiplier = pow(2.0, Double(min(consecutiveFailures - Self.backoffThreshold, Self.maxBackoffExponent)))
+            return min(Self.maxBackoffSeconds, pollInterval * backoffMultiplier * Double.random(in: 0.5...1.5))
+        } else {
+            return lastDetectedFace ? pollInterval : noFacePollInterval
         }
     }
 
@@ -460,10 +476,6 @@ final class FaceProfileDaemon: @unchecked Sendable {
     }
 
     private func executeProfileSwitch(_ profile: String) {
-        guard profile == profileKeyboard || profile == profileGhost else {
-            logger.error("Rejected unexpected profile name: '\(profile, privacy: .public)'")
-            return
-        }
         let capturedProfile = profile
         karabinerProcessQueue.async { [weak self] in
             guard let self else { return }

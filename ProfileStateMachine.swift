@@ -2,14 +2,16 @@
 // Pure state machine for face-presence profile switching.
 // Decoupled from I/O (camera, HID, karabiner_cli) for testability.
 
+import Foundation
+
 public struct ProfileStateMachine {
     public let profileKeyboard: String
     public let profileGhost: String
-    public let pollInterval: Double
-    public let noFaceTimeout: Double
+    public let pollInterval: TimeInterval
+    public let noFaceTimeout: TimeInterval
 
     public private(set) var cachedProfile: String? = nil
-    public private(set) var noFaceStreak: Double = 0
+    public private(set) var noFaceStreak: TimeInterval = 0
 
     public enum Action: Equatable {
         case switchProfile(String)
@@ -19,8 +21,8 @@ public struct ProfileStateMachine {
     public init(
         profileKeyboard: String = "⌨️",
         profileGhost: String = "👻",
-        pollInterval: Double = 30,
-        noFaceTimeout: Double = 300
+        pollInterval: TimeInterval = 30,
+        noFaceTimeout: TimeInterval = 300
     ) {
         self.profileKeyboard = profileKeyboard
         self.profileGhost = profileGhost
@@ -33,7 +35,7 @@ public struct ProfileStateMachine {
         return selectProfile(profileKeyboard)
     }
 
-    public mutating func onNoFace(elapsed: Double? = nil) -> Action {
+    public mutating func onNoFace(elapsed: TimeInterval? = nil) -> Action {
         noFaceStreak += elapsed ?? pollInterval
         if noFaceStreak >= noFaceTimeout {
             return selectProfile(profileGhost)
