@@ -22,10 +22,11 @@
     <key>RunAtLoad</key>
     <true/>
 
-    <!-- Redirect stdout/stderr to log files (no disk writes from the binary itself) -->
+    <!-- Daemon uses os_log (Logger) for all logging; redirect stdout/stderr to
+         /dev/null to avoid unbounded log file growth on disk. -->
     <key>StandardOutPath</key>
-    <string>__HOME__/Library/Logs/face-profile-daemon.out.log</string>
+    <string>/dev/null</string>
     <key>StandardErrorPath</key>
-    <string>__HOME__/Library/Logs/face-profile-daemon.err.log</string>
+    <string>/dev/null</string>
 </dict>
 </plist>

@@ -87,6 +87,7 @@ final class DefaultKarabinerCLIExecutor: KarabinerCLIExecuting {
             let result = semaphore.wait(timeout: .now() + 5.0)
             if result == .timedOut {
                 proc.terminate()
+                proc.waitUntilExit()
                 return .timedOut
             }
             if proc.terminationStatus != 0 {
@@ -214,6 +215,9 @@ final class FaceProfileDaemon: @unchecked Sendable {
 
         builtinLocationIDs = enumerateBuiltinSPILocationIDs()
         logger.info("Built-in SPI HID location IDs: \(self.builtinLocationIDs.description, privacy: .public)")
+        if builtinLocationIDs.isEmpty {
+            logger.warning("No built-in SPI devices found — HID activity detection will be disabled")
+        }
 
         installHIDMonitor()
 
@@ -256,6 +260,10 @@ final class FaceProfileDaemon: @unchecked Sendable {
     }
 
     func shutdown() {
+        // Restore keyboard profile so the user isn't stuck on ghost if daemon exits
+        logger.info("Restoring '\(self.profileKeyboard, privacy: .public)' profile before shutdown")
+        _ = karabiner.runSelectProfile(profileKeyboard)
+
         if let mgr = hidManager {
             IOHIDManagerRegisterInputValueCallback(mgr, nil, nil)
             IOHIDManagerClose(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
@@ -335,7 +343,7 @@ final class FaceProfileDaemon: @unchecked Sendable {
             if kr != kIOReturnSuccess {
                 // HID monitoring is non-functional: noFaceStreak will not reset on
                 // keyboard/trackpad activity; only face-detection polls drive state.
-                self.logger.warning("IOHIDManager open returned 0x\(String(kr, radix: 16), privacy: .public)")
+                self.logger.error("IOHIDManager open failed (0x\(String(kr, radix: 16), privacy: .public)) — HID monitoring disabled; only face detection polls will drive profile state")
             }
             CFRunLoopRun()
             IOHIDManagerUnscheduleFromRunLoop(mgr, runLoop, CFRunLoopMode.defaultMode.rawValue)
@@ -396,9 +404,9 @@ final class FaceProfileDaemon: @unchecked Sendable {
                 lastDetectedFace = detected
                 if detected {
                     stateQueue.async {
+                        self.logger.info("Face detected → \(self.profileKeyboard, privacy: .public)")
                         let action = self.stateMachine.onFaceDetected()
                         self.handleAction(action)
-                        self.logger.info("Face detected → \(self.profileKeyboard, privacy: .public)")
                     }
                 } else {
                     let elapsed = lastSleepTime
@@ -424,8 +432,11 @@ final class FaceProfileDaemon: @unchecked Sendable {
 
             let sleepTime: Double
             if consecutiveFailures >= 5 {
+                if consecutiveFailures == 50 {
+                    logger.critical("Camera appears permanently unavailable after \(consecutiveFailures) consecutive failures")
+                }
                 let backoffMultiplier = pow(2.0, Double(min(consecutiveFailures - 5, 8)))
-                sleepTime = min(300.0, pollInterval * backoffMultiplier)
+                sleepTime = min(300.0, pollInterval * backoffMultiplier * Double.random(in: 0.5...1.5))
             } else {
                 sleepTime = lastDetectedFace ? pollInterval : noFacePollInterval
             }
